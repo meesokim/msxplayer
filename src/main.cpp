@@ -42,7 +42,7 @@ bool vramViewerMode = false;
 bool scanlinesEnabled = true;
 UInt8 bios[0x8000]; 
 static UInt8 primarySlot = 0x00; 
-static int romActualSize = 0;
+static int romSizeTotal = 0; // Renamed from romActualSize
 static AY8910* psg = NULL;
 static bool vdpCreated = false;
 
@@ -93,11 +93,36 @@ bool updateTimers(UInt32 time) {
 
 extern "C" {
     UInt8 ram[0x10000];
-    UInt8 rom[0x10000]; 
+    UInt8* romData = NULL;
+    int romSize = 0;
+}
+
+MapperType romMapper = MAPPER_NONE;
+int romBanks[4] = {0, 1, 2, 3};
+
+static void detectMapper() {
+    romMapper = MAPPER_NONE;
+    if (romSize <= 0x8000) return; // 32KB or less is not a MegaROM
+    
+    // Default to Konami
+    romMapper = MAPPER_KONAMI;
+    
+    // Heuristic: Check for 'AB' signature at 0x4000
+    if (romSize > 0x4000 && romData[0] == 'A' && romData[1] == 'B') {
+        // Many ASCII games also have 'AB' signature.
+        // Konami games often have specific strings.
+        // For now, Konami is a safe default for most MegaROMs.
+    }
+    
+    // If ROM size is exactly 128KB or 256KB and not from Konami, 
+    // it *might* be ASCII8. This is a very rough heuristic.
+    // In a real emulator, we'd use a checksum database.
+    
+    romBanks[0] = 0; romBanks[1] = 1; romBanks[2] = 2; romBanks[3] = 3;
 }
 
 bool loadRom(const char* filename) {
-    memset(rom, 0xFF, sizeof(rom));
+    if (romData) { free(romData); romData = NULL; }
     if (strstr(filename, ".zip") || strstr(filename, ".ZIP")) {
         unzFile uf = unzOpen(filename);
         if (!uf) return false;
@@ -108,19 +133,21 @@ bool loadRom(const char* filename) {
             std::string low = name; std::transform(low.begin(), low.end(), low.begin(), ::tolower);
             if (low.find(".rom") != std::string::npos || low.find(".mx1") != std::string::npos) {
                 if (unzOpenCurrentFile(uf) != UNZ_OK) break;
-                romActualSize = info.uncompressed_size;
-                if (romActualSize > 0x10000) romActualSize = 0x10000;
-                unzReadCurrentFile(uf, rom, romActualSize);
+                romSize = info.uncompressed_size;
+                romData = (UInt8*)malloc(romSize);
+                unzReadCurrentFile(uf, romData, romSize);
                 unzCloseCurrentFile(uf); unzClose(uf);
+                detectMapper();
                 return true;
             }
         } while (unzGoToNextFile(uf) == UNZ_OK);
         unzClose(uf); return false;
     } else {
         FILE* f = fopen(filename, "rb"); if (!f) return false;
-        fseek(f, 0, SEEK_END); romActualSize = ftell(f); fseek(f, 0, SEEK_SET);
-        if (romActualSize > 0x10000) romActualSize = 0x10000;
-        fread(rom, 1, romActualSize, f); fclose(f);
+        fseek(f, 0, SEEK_END); romSize = ftell(f); fseek(f, 0, SEEK_SET);
+        romData = (UInt8*)malloc(romSize);
+        fread(romData, 1, romSize, f); fclose(f);
+        detectMapper();
         return true;
     }
 }
@@ -130,17 +157,46 @@ UInt8 readMemory(void* ref, UInt16 address) {
     int slot = (primarySlot >> (page * 2)) & 0x03;
     if (slot == 0) return (address < 0x8000) ? bios[address] : ram[address];
     if (slot == 1 || slot == 2) {
-        if (address >= 0x4000) {
-            UInt16 off = address - 0x4000;
-            if (romActualSize <= 0x4000) off &= 0x3FFF;
-            if (off < romActualSize) return rom[off];
+        if (!romData) return 0xFF;
+        if (romMapper == MAPPER_NONE) {
+            if (address >= 0x4000) {
+                UInt16 off = address - 0x4000;
+                if (romSize <= 0x4000) off &= 0x3FFF;
+                if (off < romSize) return romData[off];
+            }
+        } else {
+            // Konami, Konami SCC, ASCII8 (8KB banks)
+            if (address >= 0x4000 && address < 0xC000) {
+                int bankIdx = (address - 0x4000) / 0x2000;
+                int bank = romBanks[bankIdx];
+                int offset = (bank * 0x2000) + (address % 0x2000);
+                if (offset < romSize) return romData[offset];
+            }
         }
         return 0xFF;
     }
     return (slot == 3) ? ram[address] : 0xFF;
 }
 
-void writeMemory(void* ref, UInt16 address, UInt8 value) { ram[address] = value; }
+void writeMemory(void* ref, UInt16 address, UInt8 value) {
+    int page = address >> 14;
+    int slot = (primarySlot >> (page * 2)) & 0x03;
+    
+    // MegaROM bank switching
+    if ((slot == 1 || slot == 2) && address >= 0x4000 && address < 0xC000) {
+        if (romMapper == MAPPER_KONAMI) {
+            if (address == 0x6000) romBanks[1] = value % (romSize / 0x2000);
+            else if (address == 0x8000) romBanks[2] = value % (romSize / 0x2000);
+            else if (address == 0xA000) romBanks[3] = value % (romSize / 0x2000);
+        } else if (romMapper == MAPPER_ASCII8) {
+            if (address >= 0x6000 && address < 0x6800) romBanks[0] = value % (romSize / 0x2000);
+            else if (address >= 0x6800 && address < 0x7000) romBanks[1] = value % (romSize / 0x2000);
+            else if (address >= 0x7000 && address < 0x7800) romBanks[2] = value % (romSize / 0x2000);
+            else if (address >= 0x7800 && address < 0x8000) romBanks[3] = value % (romSize / 0x2000);
+        }
+    }
+    ram[address] = value; 
+}
 
 extern "C" UInt8 r800ReadIo(void* ref, UInt16 address) {
     UInt8 port = address & 0xFF;

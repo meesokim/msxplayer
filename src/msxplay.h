@@ -23,7 +23,8 @@ extern "C" {
 
 extern R800* cpu;
 extern UInt8 ram[0x10000];
-extern UInt8 rom[0x10000];
+extern UInt8* romData;
+extern int romSize;
 extern bool debugMode;
 extern bool vramViewerMode;
 extern bool scanlinesEnabled;
@@ -31,6 +32,10 @@ extern bool scanlinesEnabled;
 #ifdef __cplusplus
 }
 #endif
+
+enum MapperType { MAPPER_NONE, MAPPER_KONAMI, MAPPER_KONAMI_SCC, MAPPER_ASCII8, MAPPER_ASCII16 };
+extern MapperType romMapper;
+extern int romBanks[4];
 
 typedef UInt8 (*IoPortRead)(void*, UInt16);
 typedef void  (*IoPortWrite)(void*, UInt16, UInt8);
