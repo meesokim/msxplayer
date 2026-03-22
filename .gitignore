@@ -5,6 +5,9 @@ test_sdl
 test_sdl.exe
 sc2_check
 sc2_check.exe
+*.exe
+*.rom
+*.zip
 
 # Object files
 *.o
