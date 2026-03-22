@@ -79,8 +79,9 @@ Inflate.o: $(BLUE_MSX_SRC)/Unzip/inflate.c
 	$(CC) -c $< -o $@ $(CFLAGS)
 InfTrees.o: $(BLUE_MSX_SRC)/Unzip/inftrees.c
 	$(CC) -c $< -o $@ $(CFLAGS)
-Zutil.o: $(BLUE_MSX_SRC)/Unzip/zutil.c
-	$(CC) -c $< -o $@ $(CFLAGS)
+LDFLAGS = -lSDL2 -lz -lGL
+
+# ... (middle parts unchanged)
 
 # Windows cross-compilation
 WIN_CC = x86_64-w64-mingw32-gcc
@@ -90,7 +91,7 @@ WIN_INCLUDES = $(INCLUDES) -I$(LOCAL_WIN)/include
 WIN_COMMON_FLAGS = -O2 -Wall $(WIN_INCLUDES) -DPIXEL_WIDTH=16 -DVIDEO_COLOR_TYPE_RGB565 -fpermissive -DSDL_MAIN_HANDLED
 WIN_CFLAGS = $(WIN_COMMON_FLAGS)
 WIN_CXXFLAGS = $(WIN_COMMON_FLAGS) -std=c++11
-WIN_LDFLAGS = -L$(LOCAL_WIN)/lib -static -lmingw32 -lSDL2main -lSDL2 -mconsole -lkernel32 -luser32 -lgdi32 -lwinmm -limm32 -lole32 -loleaut32 -lversion -luuid -ladvapi32 -lsetupapi -lshell32
+WIN_LDFLAGS = -L$(LOCAL_WIN)/lib -static -lmingw32 -lSDL2main -lSDL2 -mconsole -lopengl32 -lkernel32 -luser32 -lgdi32 -lwinmm -limm32 -lole32 -loleaut32 -lversion -luuid -ladvapi32 -lsetupapi -lshell32
 
 win_%.o: src/%.cpp
 	$(WIN_CXX) -c $< -o $@ $(WIN_CXXFLAGS)

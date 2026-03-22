@@ -30,9 +30,11 @@ extern "C" void RefreshScreen(int);
 extern "C" void* ioPortGetRef(int port);
 extern "C" void saveScreenshot(const char* filename);
 extern "C" void updateSound();
+extern "C" SDL_Window* getMainWindow();
 
 bool debugMode = false;
 bool vramViewerMode = false;
+bool scanlinesEnabled = true;
 static UInt8 bios[0x8000]; 
 static UInt8 primarySlot = 0x00; 
 static int romActualSize = 0;
@@ -124,16 +126,13 @@ bool loadRom(const char* filename) {
 UInt8 readMemory(void* ref, UInt16 address) {
     int page = address >> 14;
     int slot = (primarySlot >> (page * 2)) & 0x03;
-    
     if (slot == 0) {
         if (address < 0x8000) return bios[address];
         return ram[address];
-    } 
-    else if (slot == 1 || slot == 2) {
+    } else if (slot == 1 || slot == 2) {
         if (address >= 0x4000 && address < 0xC000) {
             UInt16 offset = address - 0x4000;
             if (romActualSize <= 0x4000) offset &= 0x3FFF;
-            
             if (debugMode && (address == 0x4000 || address == 0x8000)) {
                 static int lastAddr = -1;
                 if (address != lastAddr) {
@@ -144,8 +143,7 @@ UInt8 readMemory(void* ref, UInt16 address) {
             return rom[offset];
         }
         return 0xFF;
-    } 
-    else if (slot == 3) {
+    } else if (slot == 3) {
         return ram[address];
     }
     return 0xFF;
@@ -319,10 +317,7 @@ int main(int argc, char* argv[]) {
         else romFile = argv[i];
     }
 
-    if (debugMode) printf("msxplay starting in debug mode...\n");
-
     if (!loadRom(romFile)) return 1;
-
     FILE* bf = fopen("cbios_main_msx1.rom", "rb");
     if (!bf) return 1;
     fread(bios, 1, 0x8000, bf); fclose(bf);
@@ -333,8 +328,6 @@ int main(int argc, char* argv[]) {
     vdpCreate(VDP_MSX, VDP_TMS99x8A, VDP_SYNC_60HZ, 1);
     vdpSetSpritesEnable(1);
     vdpSetNoSpriteLimits(1);
-
-    if (debugMode) runVdpDiagnostics();
 
     AY8910* psg = ay8910Create(NULL, AY8910_MSX, PSGTYPE_AY8910, 0, NULL);
     ay8910SetIoPort(psg, psgRead, psgRead, psgWrite, NULL);
@@ -348,7 +341,8 @@ int main(int argc, char* argv[]) {
     ioPortRegister(0xA9, (IoPortRead)keyboardRead, NULL, NULL);
     ioPortRegister(0xAA, NULL, (IoPortWrite)keyboardWrite, NULL);
 
-    bool quit = false; SDL_Event e; Uint32 lastTime = SDL_GetTicks();
+    bool quit = false; bool fullscreen = false;
+    SDL_Event e; Uint32 lastTime = SDL_GetTicks();
     while (!quit) {
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) quit = true;
@@ -357,6 +351,19 @@ int main(int argc, char* argv[]) {
                 if (e.key.keysym.sym == SDLK_PRINTSCREEN) {
                     saveVramSc2("capture.sc2");
                     saveScreenshot("capture.bmp");
+                }
+                if (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)) {
+                    fullscreen = !fullscreen;
+                    SDL_SetWindowFullscreen(getMainWindow(), fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                }
+                if (e.key.keysym.sym == SDLK_F7) {
+                    r800Reset(cpu, 0);
+                    primarySlot = 0x00;
+                    if (debugMode) printf("Emulator Reset (F7 pressed).\n");
+                }
+                if (e.key.keysym.sym == SDLK_F8) {
+                    scanlinesEnabled = !scanlinesEnabled;
+                    if (debugMode) printf("Scanlines: %s\n", scanlinesEnabled ? "ON" : "OFF");
                 }
             }
         }
