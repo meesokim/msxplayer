@@ -2,6 +2,8 @@
 #include "FrameBuffer.h"
 #include <stdio.h>
 #include <string.h>
+#include <vector>
+#include <string>
 #define GL_GLEXT_PROTOTYPES
 #include <SDL2/SDL_opengl.h>
 
@@ -76,12 +78,78 @@ extern "C" UInt16* vdpGetPalettePtr();
 extern "C" int vdpGetScreenOn();
 extern "C" int vdpGetScreenMode();
 extern "C" UInt8* vdpGetRegsPtr();
+extern UInt8 bios[0x8000];
 
 static UInt16 frameBuffer[272 * 240];
 
+// Basic font renderer using BIOS font
+static void drawChar(int x, int y, char c, UInt16 fg, UInt16 bg, int w) {
+    if (x < 0 || x > 272-w || y < 0 || y > 232) return;
+    const UInt8* font = bios + 0x1BBF; // Standard MSX BIOS font location
+    for (int i = 0; i < 8; i++) {
+        UInt8 pat = font[(UInt8)c * 8 + i];
+        for (int b = 0; b < w; b++) {
+            frameBuffer[(y + i) * 272 + (x + b)] = (pat & (0x80 >> (b * 8 / w))) ? fg : bg;
+        }
+    }
+}
+
+static void drawText(int x, int y, const char* txt, UInt16 fg, UInt16 bg, int w) {
+    while (*txt) {
+        drawChar(x, y, *txt++, fg, bg, w);
+        x += w;
+    }
+}
+
+extern "C" void DrawMenu(const std::vector<std::string>& files, int selected, int offset) {
+    if (!window) return;
+    memset(frameBuffer, 0, sizeof(frameBuffer));
+
+    drawText(8, 4, "[MSXPLAYER ROM SELECT]", 0xFFFF, 0, 8);
+
+    // Page counter
+    int pageSize = 24;
+    int totalPages = (files.size() + pageSize - 1) / pageSize;
+    int curPage = (offset / pageSize) + 1;
+    char pageBuf[16];
+    sprintf(pageBuf, "%d/%d", curPage, totalPages);
+    drawText(220, 4, pageBuf, 0xFFE0, 0, 8); // Yellow page counter
+
+    for (int i = 0; i < pageSize && (offset + i) < files.size(); i++) {
+        int idx = offset + i;
+        bool isSel = (idx == selected);
+        UInt16 fg = isSel ? 0x0000 : 0xFFFF;
+        UInt16 bg = isSel ? 0xF800 : 0x0000;
+
+        char buf[41];
+        strncpy(buf, files[idx].c_str(), 40); buf[40] = 0;
+
+        if (isSel) {
+            for (int ry = 0; ry < 8; ry++) {
+                for (int rx = 0; rx < 272; rx++) {
+                    frameBuffer[(16 + i * 8 + ry) * 272 + rx] = bg;
+                }
+            }
+        }
+
+        // drawText(8, 16 + i * 8, (idx == selected) ? ">" : " ", fg, bg, 6);
+        drawText(8, 16 + i * 8, buf, fg, bg, 6);
+    }
+
+
+    int winW, winH; SDL_GetWindowSize(window, &winW, &winH);
+    glViewport(0, 0, winW, winH);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBindTexture(GL_TEXTURE_2D, textureId);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 272, 240, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, frameBuffer);
+    _glUseProgram(shaderProgram);
+    _glUniform1f(u_scanline_loc, 0.0f);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    SDL_GL_SwapWindow(window);
+}
+
 extern "C" void RefreshScreen(int screenMode) {
     if (!window) return;
-    
     UInt8* vram = vdpGetVramPtr();
     UInt16* palette = vdpGetPalettePtr();
     UInt8* regs = vdpGetRegsPtr();
@@ -93,7 +161,6 @@ extern "C" void RefreshScreen(int screenMode) {
     int mode = vdpGetScreenMode();
     int vramMask = 0x3FFF;
 
-    // Highly optimized clear
     for (int i = 0; i < 272 * 240; i++) frameBuffer[i] = bgPixel;
 
     if (displayEnabled) {
@@ -102,22 +169,30 @@ extern "C" void RefreshScreen(int screenMode) {
             int fg = regs[7] >> 4, bg = regs[7] & 0x0F;
             UInt16 pfg = palette[fg], pbg = palette[bg];
             for (int y = 0; y < 192; y++) {
-                int py = y % 8, row = (y / 8) * 40;
-                int dstOff = (y + 24) * 272 + 16;
+                int py = y % 8, row = (y / 8) * 40, dstOff = (y + 24) * 272 + 16;
                 for (int tx = 0; tx < 40; tx++) {
                     UInt8 pat = vram[(pb + vram[(nt + row + tx) & vramMask] * 8 + py) & vramMask];
                     for (int b = 0; b < 6; b++) frameBuffer[dstOff + tx*6 + b] = (pat & (0x80 >> b)) ? pfg : pbg;
                 }
             }
         } else if (mode == 1) { // Screen 1
-            int nt = (regs[2] << 10) & vramMask, pb = (regs[4] << 11) & vramMask, ct = (regs[3] << 6) & vramMask;
+            int nt = (regs[2] << 10) & vramMask;
+            int pb = (regs[4] << 11) & vramMask;
+            int ct = (regs[3] << 6) & vramMask;
             for (int y = 0; y < 192; y++) {
-                int py = y % 8, row = (y / 8) * 32, dstOff = (y + 24) * 272 + 8;
+                int ty = y / 8;
+                int py = y % 8;
+                int rowStart = ty * 32;
+                int dstOff = (y + 24) * 272 + 8;
                 for (int tx = 0; tx < 32; tx++) {
-                    int code = vram[(nt + row + tx) & vramMask];
-                    UInt8 pat = vram[(pb + code * 8 + py) & vramMask], col = vram[(ct + code / 8) & vramMask];
-                    UInt16 pfg = palette[col >> 4 ? col >> 4 : bgCol], pbg = palette[col & 0x0F ? col & 0x0F : bgCol];
-                    for (int b = 0; b < 8; b++) frameBuffer[dstOff + tx*8 + b] = (pat & (0x80 >> b)) ? pfg : pbg;
+                    int code = vram[(nt + rowStart + tx) & vramMask];
+                    UInt8 pat = vram[(pb + code * 8 + py) & vramMask];
+                    UInt8 col = vram[(ct + code / 8) & vramMask];
+                    UInt16 pfg = palette[col >> 4 ? col >> 4 : bgCol];
+                    UInt16 pbg = palette[col & 0x0F ? col & 0x0F : bgCol];
+                    for (int b = 0; b < 8; b++) {
+                        frameBuffer[dstOff + tx * 8 + b] = (pat & (0x80 >> b)) ? pfg : pbg;
+                    }
                 }
             }
         } else { // Screen 2
@@ -186,7 +261,7 @@ extern "C" void saveScreenshot(const char* filename) {
 void initVideo() {
     window = SDL_CreateWindow("msxplay", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 272*2, 240*2, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL);
     glContext = SDL_GL_CreateContext(window);
-    SDL_GL_SetSwapInterval(0); // DISABLE V-Sync to avoid blocking main loop
+    SDL_GL_SetSwapInterval(0);
 
     LOAD_GL(glCreateShader, PFNGLCREATESHADERPROC);
     LOAD_GL(glShaderSource, PFNGLSHADERSOURCEPROC);

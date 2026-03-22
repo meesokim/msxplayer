@@ -23,7 +23,7 @@ extern "C" {
 
 extern R800* cpu;
 extern UInt8 ram[0x10000];
-extern UInt8 rom[0xC000];
+extern UInt8 rom[0x10000];
 extern bool debugMode;
 extern bool vramViewerMode;
 extern bool scanlinesEnabled;
