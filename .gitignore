@@ -1,0 +1,26 @@
+# Compiled binaries
+msxplay
+msxplay.exe
+test_sdl
+test_sdl.exe
+sc2_check
+sc2_check.exe
+
+# Object files
+*.o
+
+# Capture files
+capture.sc2
+capture.bmp
+check_sc2.bmp
+
+# Logs
+output.txt
+output_debug.txt
+output_no_debug.txt
+output_vram.txt
+output_no_vram.txt
+
+# OS files
+.DS_Store
+Thumbs.db
