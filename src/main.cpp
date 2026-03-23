@@ -9,6 +9,10 @@
 #include <algorithm>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <limits.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 extern "C" {
     extern R800* cpu;
@@ -41,7 +45,8 @@ bool debugMode = false;
 bool vramViewerMode = false;
 bool scanlinesEnabled = true;
 UInt8 bios[0x8000]; 
-static UInt8 primarySlot = 0x00; 
+UInt8 bios_logo[0x4000];
+UInt8 primarySlot = 0x00; 
 static int romSizeTotal = 0; // Renamed from romActualSize
 static AY8910* psg = NULL;
 static bool vdpCreated = false;
@@ -131,7 +136,7 @@ bool loadRom(const char* filename) {
             unz_file_info info; char name[256];
             if (unzGetCurrentFileInfo(uf, &info, name, 256, NULL, 0, NULL, 0) != UNZ_OK) break;
             std::string low = name; std::transform(low.begin(), low.end(), low.begin(), ::tolower);
-            if (low.find(".rom") != std::string::npos || low.find(".mx1") != std::string::npos) {
+            if (low.find(".rom") != std::string::npos || low.find(".mx1") != std::string::npos || low.find(".bin") != std::string::npos) {
                 if (unzOpenCurrentFile(uf) != UNZ_OK) break;
                 romSize = info.uncompressed_size;
                 romData = (UInt8*)malloc(romSize);
@@ -148,6 +153,7 @@ bool loadRom(const char* filename) {
         romData = (UInt8*)malloc(romSize);
         fread(romData, 1, romSize, f); fclose(f);
         detectMapper();
+        printf("loadRom: Loaded '%s', size=%d, mapper=%d\n", filename, romSize, romMapper); fflush(stdout);
         return true;
     }
 }
@@ -155,14 +161,23 @@ bool loadRom(const char* filename) {
 UInt8 readMemory(void* ref, UInt16 address) {
     int page = address >> 14;
     int slot = (primarySlot >> (page * 2)) & 0x03;
-    if (slot == 0) return (address < 0x8000) ? bios[address] : ram[address];
+    if (slot == 0) {
+        if (address < 0x8000) return bios[address];
+        if (address < 0xC000) return bios_logo[address - 0x8000];
+        return ram[address];
+    }
     if (slot == 1 || slot == 2) {
         if (!romData) return 0xFF;
         if (romMapper == MAPPER_NONE) {
-            if (address >= 0x4000) {
-                UInt16 off = address - 0x4000;
-                if (romSize <= 0x4000) off &= 0x3FFF;
-                if (off < romSize) return romData[off];
+            bool startsAtZero = ((primarySlot & 0x03) == 0x01);
+            if (startsAtZero) {
+                if (address < romSize) return romData[address];
+            } else { // Starts at 0x4000
+                if (address >= 0x4000) {
+                    UInt16 off = address - 0x4000;
+                    if (romSize <= 0x4000) off &= 0x3FFF;
+                    if (off < romSize) return romData[off];
+                }
             }
         } else {
             // Konami, Konami SCC, ASCII8 (8KB banks)
@@ -181,35 +196,48 @@ UInt8 readMemory(void* ref, UInt16 address) {
 void writeMemory(void* ref, UInt16 address, UInt8 value) {
     int page = address >> 14;
     int slot = (primarySlot >> (page * 2)) & 0x03;
-    
-    // MegaROM bank switching
-    if ((slot == 1 || slot == 2) && address >= 0x4000 && address < 0xC000) {
+
+    // First, handle mapper register writes, which are exceptions
+    if ((slot == 1 || slot == 2) && romMapper != MAPPER_NONE) {
         if (romMapper == MAPPER_KONAMI) {
-            if (address == 0x6000) romBanks[1] = value % (romSize / 0x2000);
-            else if (address == 0x8000) romBanks[2] = value % (romSize / 0x2000);
-            else if (address == 0xA000) romBanks[3] = value % (romSize / 0x2000);
+            if (address == 0x6000 || address == 0x8000 || address == 0xA000) {
+                 if (address == 0x6000) romBanks[1] = value % (romSize / 0x2000);
+                 else if (address == 0x8000) romBanks[2] = value % (romSize / 0x2000);
+                 else if (address == 0xA000) romBanks[3] = value % (romSize / 0x2000);
+                 return;
+            }
         } else if (romMapper == MAPPER_ASCII8) {
-            if (address >= 0x6000 && address < 0x6800) romBanks[0] = value % (romSize / 0x2000);
-            else if (address >= 0x6800 && address < 0x7000) romBanks[1] = value % (romSize / 0x2000);
-            else if (address >= 0x7000 && address < 0x7800) romBanks[2] = value % (romSize / 0x2000);
-            else if (address >= 0x7800 && address < 0x8000) romBanks[3] = value % (romSize / 0x2000);
+            if (address >= 0x6000 && address < 0x8000) {
+                if (address >= 0x6000 && address < 0x6800) romBanks[0] = value;
+                else if (address >= 0x6800 && address < 0x7000) romBanks[1] = value;
+                else if (address >= 0x7000 && address < 0x7800) romBanks[2] = value;
+                else if (address >= 0x7800 && address < 0x8000) romBanks[3] = value;
+                return;
+            }
         }
     }
-    ram[address] = value; 
+
+    // If not a mapper write, check if the area is RAM
+    if (slot == 3) {
+        ram[address] = value;
+        return;
+    }
+    if (slot == 0 && address >= 0xc000) {
+        ram[address] = value;
+        return;
+    }
+
+    // Otherwise, it's a write to a ROM area, so ignore it.
 }
 
 extern "C" UInt8 r800ReadIo(void* ref, UInt16 address) {
-    UInt8 port = address & 0xFF;
-    if (port == 0xA8) return primarySlot;
     UInt8 val = readIoPort(ref, address);
-    if (port == 0x99) boardClearInt(1);
+    if ((address & 0xFF) == 0x99) boardClearInt(1);
     return val;
 }
 
 extern "C" void r800WriteIo(void* ref, UInt16 address, UInt8 value) {
-    UInt8 port = address & 0xFF;
-    if (port == 0xA8) primarySlot = value;
-    else writeIoPort(ref, address, value);
+    writeIoPort(ref, address, value);
 }
 
 static UInt8 selectedRow = 0;
@@ -280,7 +308,31 @@ void startEmulator() {
     ioPortRegister(0xA0, NULL, (IoPortWrite)myPsgWriteAddr, psg); ioPortRegister(0xA1, NULL, (IoPortWrite)ay8910WriteData, psg); ioPortRegister(0xA2, (IoPortRead)ay8910ReadData, NULL, psg);
     ioPortRegister(0xA9, (IoPortRead)keyboardRead, NULL, NULL); ioPortRegister(0xAA, NULL, (IoPortWrite)keyboardWrite, NULL);
     if (!cpu) cpu = r800Create(0, (R800ReadCb)readMemory, (R800WriteCb)writeMemory, (R800ReadCb)r800ReadIo, (R800WriteCb)r800WriteIo, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
-    r800Reset(cpu, 0); primarySlot = 0x00;
+    r800Reset(cpu, 0);
+    if (romData) {
+        if (romMapper == MAPPER_NONE) {
+            bool mapFromZero = false;
+            // Heuristic for plain ROMs that start at 0x0000
+            if (romSize <= 0x4000 && !(romData[0] == 'A' && romData[1] == 'B')) {
+                mapFromZero = true;
+            }
+
+            if (mapFromZero) {
+                if (romSize <= 0x4000) { // <= 16KB at 0x0000
+                    primarySlot = 0xFD; // P0=ROM, P1-3=RAM
+                } else { // <= 32KB at 0x0000
+                    primarySlot = 0xF5; // P0,P1=ROM, P2-3=RAM
+                }
+            } else { // Standard ROM at 0x4000
+                primarySlot = 0xD4;
+            }
+        } else { // Mapped ROMs
+            primarySlot = 0xD4; // Most mappers use 0x4000-0xBFFF
+        }
+    } else {
+        primarySlot = 0x00;
+    }
+    printf("startEmulator: primarySlot set to 0x%02X\n", primarySlot); fflush(stdout);
 }
 
 static std::vector<std::string> scanDirectory(const char* path) {
@@ -310,6 +362,7 @@ int main(int argc, char* argv[]) {
     }
     struct stat st; if (stat(targetPath, &st) == 0 && S_ISREG(st.st_mode)) pathIsFile = true;
     FILE* bf = fopen("cbios_main_msx1.rom", "rb"); if (!bf) return 1; fread(bios, 1, 0x8000, bf); fclose(bf);
+    FILE* lf = fopen("cbios_logo_msx1.rom", "rb"); if (lf) { fread(bios_logo, 1, 0x4000, lf); fclose(lf); }
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_AUDIO) < 0) return 1;
     initVideo(); initSound();
     std::vector<std::string> romFiles; int menuSel = 0, menuOff = 0; std::string baseDir = targetPath;
@@ -327,6 +380,7 @@ int main(int argc, char* argv[]) {
         }
     }
     bool quit = false, fullscreen = false; SDL_Event e; Uint32 lastTime = SDL_GetTicks();
+    printf("main: Entering main loop.\n"); fflush(stdout);
     while (!quit) {
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) quit = true;
@@ -343,6 +397,21 @@ int main(int argc, char* argv[]) {
                     else if (e.key.keysym.sym == SDLK_RETURN) {
                         std::string full = baseDir + "/" + romFiles[menuSel];
                         if (loadRom(full.c_str())) { saveLastGame(romFiles[menuSel].c_str()); startEmulator(); appState = STATE_EMU; }
+                    } else if (e.key.keysym.sym == SDLK_c && (e.key.keysym.mod & KMOD_CTRL)) {
+                        if (!romFiles.empty() && menuSel >= 0 && menuSel < romFiles.size()) {
+                            std::string full = baseDir + "/" + romFiles[menuSel];
+#ifdef _WIN32
+                            char resolved_path[MAX_PATH];
+                            if (_fullpath(resolved_path, full.c_str(), MAX_PATH)) {
+                                SDL_SetClipboardText(resolved_path);
+                            }
+#else
+                            char resolved_path[PATH_MAX];
+                            if (realpath(full.c_str(), resolved_path)) {
+                                SDL_SetClipboardText(resolved_path);
+                            }
+#endif
+                        }
                     }
                     if (menuSel < 0) menuSel = 0; if (menuSel >= (int)romFiles.size()) menuSel = (int)romFiles.size() - 1;
                     if (menuSel < menuOff) menuOff = menuSel; if (menuSel >= menuOff + pageSize) menuOff = menuSel - pageSize + 1;
@@ -359,7 +428,8 @@ int main(int argc, char* argv[]) {
             if ((Int32)(now - lastTime) >= 16) {
                 for (int i = 0; i < 262; i++) {
                     currentBoardTime += 1368; r800ExecuteUntil(cpu, currentBoardTime);
-                    handleHLE(cpu); while (updateTimers(currentBoardTime));
+                    handleHLE(cpu); 
+                    while (updateTimers(currentBoardTime));
                 }
                 RefreshScreen(0); updateSound(); lastTime = now;
             } else SDL_Delay(1);
