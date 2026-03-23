@@ -1,6 +1,7 @@
 #include "msxplay.h"
 #include "FrameBuffer.h"
 #include "unzip.h"
+#include "bios_data.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,8 +45,6 @@ extern "C" SDL_Window* getMainWindow();
 bool debugMode = false;
 bool vramViewerMode = false;
 bool scanlinesEnabled = true;
-UInt8 bios[0x8000]; 
-UInt8 bios_logo[0x4000];
 UInt8 primarySlot = 0x00; 
 static int romSizeTotal = 0; // Renamed from romActualSize
 static AY8910* psg = NULL;
@@ -361,8 +360,6 @@ int main(int argc, char* argv[]) {
         if (strcmp(argv[i], "-d") == 0) debugMode = true; else if (strcmp(argv[i], "-v") == 0) vramViewerMode = true; else targetPath = argv[i];
     }
     struct stat st; if (stat(targetPath, &st) == 0 && S_ISREG(st.st_mode)) pathIsFile = true;
-    FILE* bf = fopen("cbios_main_msx1.rom", "rb"); if (!bf) return 1; fread(bios, 1, 0x8000, bf); fclose(bf);
-    FILE* lf = fopen("cbios_logo_msx1.rom", "rb"); if (lf) { fread(bios_logo, 1, 0x4000, lf); fclose(lf); }
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_AUDIO) < 0) return 1;
     initVideo(); initSound();
     std::vector<std::string> romFiles; int menuSel = 0, menuOff = 0; std::string baseDir = targetPath;

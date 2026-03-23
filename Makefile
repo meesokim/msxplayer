@@ -26,7 +26,7 @@ INCLUDES = -I$(BLUE_MSX_SRC)/Common \
            -I$(BLUE_MSX_SRC)/VideoRender \
            -Isrc
 
-COMMON_FLAGS = -O2 -Wall $(INCLUDES) -DPIXEL_WIDTH=16 -DVIDEO_COLOR_TYPE_RGB565
+COMMON_FLAGS = -O2 -g -Wall $(INCLUDES) -DPIXEL_WIDTH=16 -DVIDEO_COLOR_TYPE_RGB565
 CFLAGS = $(COMMON_FLAGS)
 CXXFLAGS = $(COMMON_FLAGS) -std=c++11
 
@@ -39,7 +39,7 @@ PSG_SRC = $(BLUE_MSX_SRC)/SoundChips/AY8910.c
 FB_SRC  = $(BLUE_MSX_SRC)/VideoChips/FrameBuffer.c
 
 # Our source files
-MY_OBJS = main.o video.o memory.o io.o sound.o stubs.o vram_viewer.o vdp_test.o
+MY_OBJS = main.o video.o memory.o io.o sound.o stubs.o vram_viewer.o vdp_test.o bios_data.o
 BLUE_OBJS = VDP.o R800.o AY8910.o FrameBuffer.o Zip.o IoApi.o Adler32.o Crc32.o InfFast.o Inflate.o InfTrees.o Zutil.o
 OBJS = $(MY_OBJS) $(BLUE_OBJS)
 
@@ -78,6 +78,9 @@ InfFast.o: $(BLUE_MSX_SRC)/Unzip/inffast.c
 Inflate.o: $(BLUE_MSX_SRC)/Unzip/inflate.c
 	$(CC) -c $< -o $@ $(CFLAGS)
 InfTrees.o: $(BLUE_MSX_SRC)/Unzip/inftrees.c
+	$(CC) -c $< -o $@ $(CFLAGS)
+
+Zutil.o: $(BLUE_MSX_SRC)/Unzip/zutil.c
 	$(CC) -c $< -o $@ $(CFLAGS)
 LDFLAGS = -lSDL2 -lz -lGL
 

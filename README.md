@@ -17,6 +17,11 @@ A lightweight, standalone MSX1/2 emulator core integrated with SDL2, featuring h
   - **Last Game Persistence**: Remembers the last game played for quick resumption.
   - **Fullscreen Toggle**: Press `Alt + Enter` to switch between windowed and fullscreen modes.
   - **Scanline Effect**: CRT-style scanline overlay for an authentic retro feel (Toggle with `F8`).
+- **Standalone Executable**: BIOS ROMs are now embedded directly into the executable, removing the need for external `cbios_*.rom` files and making the emulator truly portable.
+- **Enhanced ROM Compatibility**:
+  - Improved mapper detection logic to correctly handle standard 32KB ROMs (e.g., *Yokai Yashiki*).
+  - Added support for 16KB ROM mirroring to fix graphical issues in games like *Dig Dug*.
+  - Added support for header-less 16KB ROMs that start at address `0x0000` (e.g., *Zenji*).
 - **Robust Input System**:
   - Comprehensive mapping of the full MSX keyboard matrix.
   - Integrated PSG Port A joystick emulation mapped to Arrow keys and Space/Z/X.
