@@ -43,11 +43,20 @@ MY_OBJS = main.o video.o memory.o io.o sound.o stubs.o vram_viewer.o vdp_test.o 
 BLUE_OBJS = VDP.o R800.o AY8910.o FrameBuffer.o Zip.o IoApi.o Adler32.o Crc32.o InfFast.o Inflate.o InfTrees.o Zutil.o
 OBJS = $(MY_OBJS) $(BLUE_OBJS)
 
-all: msxplay msxplay.exe
+all: msxplay msxplay.exe verify
 
 msxplay: $(OBJS)
 	$(CXX) -o msxplay $(OBJS) $(LDFLAGS)
 
+verify: src/verify_core.cpp
+	$(CXX) -o verify_core src/verify_core.cpp
+	./verify_core
+
+main_verify.o: src/main.cpp
+	$(CXX) -c src/main.cpp -o main_verify.o $(CXXFLAGS) -DVERIFY_CORE
+
+verify_core.o: src/verify_core.cpp
+	$(CXX) -c src/verify_core.cpp -o verify_core.o $(CXXFLAGS)
 %.o: src/%.cpp
 	$(CXX) -c $< -o $@ $(CXXFLAGS)
 

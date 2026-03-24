@@ -212,8 +212,17 @@ extern "C" void RefreshScreen(int screenMode) {
         int large = regs[1] & 0x02, mag = regs[1] & 0x01;
         int spriteTab = ((int)regs[5] << 7) & vramMask, spriteGen = ((int)regs[6] << 11) & vramMask;
         int size = mag ? (large ? 32 : 16) : (large ? 16 : 8);
+
+        int numSprites = 32;
         for (int i = 0; i < 32; i++) {
-            int sy_raw = vram[spriteTab + i * 4]; if (sy_raw == 208) break;
+            if (vram[spriteTab + i * 4] == 208) {
+                numSprites = i;
+                break;
+            }
+        }
+
+        for (int i = numSprites - 1; i >= 0; i--) {
+            int sy_raw = vram[spriteTab + i * 4];
             int sc_raw = vram[spriteTab + i * 4 + 3]; int sc = sc_raw & 0x0F; if (!sc) continue;
             int sx = vram[spriteTab + i * 4 + 1]; if (sc_raw & 0x80) sx -= 32;
             int si = vram[spriteTab + i * 4 + 2]; if (large) si &= ~0x03;

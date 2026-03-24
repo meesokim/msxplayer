@@ -48,8 +48,12 @@ A lightweight, standalone MSX1/2 emulator core integrated with SDL2, featuring h
 # Build both Linux and Windows versions
 make all
 
+# Build and run core verification tests (Mapper & VRAM)
+make verify
+
 # Build only Linux version
 make msxplay
+```
 
 # Build only Windows version
 make msxplay.exe

@@ -264,40 +264,72 @@ static void myPsgWriteAddr(void* ref, UInt16 port, UInt8 val) { ay8910WriteAddre
 void updateKeyboard() {
     const Uint8* s = SDL_GetKeyboardState(NULL);
     memset(keyMatrix, 0xFF, sizeof(keyMatrix));
-    if (s[SDL_SCANCODE_0]) keyMatrix[0] &= ~0x01; if (s[SDL_SCANCODE_1]) keyMatrix[0] &= ~0x02;
-    if (s[SDL_SCANCODE_2]) keyMatrix[0] &= ~0x04; if (s[SDL_SCANCODE_3]) keyMatrix[0] &= ~0x08;
-    if (s[SDL_SCANCODE_4]) keyMatrix[0] &= ~0x10; if (s[SDL_SCANCODE_5]) keyMatrix[0] &= ~0x20;
-    if (s[SDL_SCANCODE_6]) keyMatrix[0] &= ~0x40; if (s[SDL_SCANCODE_7]) keyMatrix[0] &= ~0x80;
-    if (s[SDL_SCANCODE_8]) keyMatrix[1] &= ~0x01; if (s[SDL_SCANCODE_9]) keyMatrix[1] &= ~0x02;
-    if (s[SDL_SCANCODE_MINUS]) keyMatrix[1] &= ~0x04; if (s[SDL_SCANCODE_EQUALS]) keyMatrix[1] &= ~0x08;
-    if (s[SDL_SCANCODE_BACKSLASH]) keyMatrix[1] &= ~0x10; if (s[SDL_SCANCODE_LEFTBRACKET]) keyMatrix[1] &= ~0x20;
-    if (s[SDL_SCANCODE_RIGHTBRACKET]) keyMatrix[1] &= ~0x40; if (s[SDL_SCANCODE_SEMICOLON]) keyMatrix[1] &= ~0x80;
-    if (s[SDL_SCANCODE_APOSTROPHE]) keyMatrix[2] &= ~0x01; if (s[SDL_SCANCODE_COMMA]) keyMatrix[2] &= ~0x04;
-    if (s[SDL_SCANCODE_PERIOD]) keyMatrix[2] &= ~0x08; if (s[SDL_SCANCODE_SLASH]) keyMatrix[2] &= ~0x10;
-    if (s[SDL_SCANCODE_A]) keyMatrix[2] &= ~0x40; if (s[SDL_SCANCODE_B]) keyMatrix[2] &= ~0x80;
-    if (s[SDL_SCANCODE_C]) keyMatrix[3] &= ~0x01; if (s[SDL_SCANCODE_D]) keyMatrix[3] &= ~0x02;
-    if (s[SDL_SCANCODE_E]) keyMatrix[3] &= ~0x04; if (s[SDL_SCANCODE_F]) keyMatrix[3] &= ~0x08;
-    if (s[SDL_SCANCODE_G]) keyMatrix[3] &= ~0x10; if (s[SDL_SCANCODE_H]) keyMatrix[3] &= ~0x20;
-    if (s[SDL_SCANCODE_I]) keyMatrix[3] &= ~0x40; if (s[SDL_SCANCODE_J]) keyMatrix[3] &= ~0x80;
-    if (s[SDL_SCANCODE_K]) keyMatrix[4] &= ~0x01; if (s[SDL_SCANCODE_L]) keyMatrix[4] &= ~0x02;
-    if (s[SDL_SCANCODE_M]) keyMatrix[4] &= ~0x04; if (s[SDL_SCANCODE_N]) keyMatrix[4] &= ~0x08;
-    if (s[SDL_SCANCODE_O]) keyMatrix[4] &= ~0x10; if (s[SDL_SCANCODE_P]) keyMatrix[4] &= ~0x20;
-    if (s[SDL_SCANCODE_Q]) keyMatrix[4] &= ~0x40; if (s[SDL_SCANCODE_R]) keyMatrix[4] &= ~0x80;
-    if (s[SDL_SCANCODE_S]) keyMatrix[5] &= ~0x01; if (s[SDL_SCANCODE_T]) keyMatrix[5] &= ~0x02;
-    if (s[SDL_SCANCODE_U]) keyMatrix[5] &= ~0x04; if (s[SDL_SCANCODE_V]) keyMatrix[5] &= ~0x08;
-    if (s[SDL_SCANCODE_W]) keyMatrix[5] &= ~0x10; if (s[SDL_SCANCODE_X]) keyMatrix[5] &= ~0x20;
-    if (s[SDL_SCANCODE_Y]) keyMatrix[5] &= ~0x40; if (s[SDL_SCANCODE_Z]) keyMatrix[5] &= ~0x80;
+    if (s[SDL_SCANCODE_0]) keyMatrix[0] &= ~0x01;
+    if (s[SDL_SCANCODE_1]) keyMatrix[0] &= ~0x02;
+    if (s[SDL_SCANCODE_2]) keyMatrix[0] &= ~0x04;
+    if (s[SDL_SCANCODE_3]) keyMatrix[0] &= ~0x08;
+    if (s[SDL_SCANCODE_4]) keyMatrix[0] &= ~0x10;
+    if (s[SDL_SCANCODE_5]) keyMatrix[0] &= ~0x20;
+    if (s[SDL_SCANCODE_6]) keyMatrix[0] &= ~0x40;
+    if (s[SDL_SCANCODE_7]) keyMatrix[0] &= ~0x80;
+    if (s[SDL_SCANCODE_8]) keyMatrix[1] &= ~0x01;
+    if (s[SDL_SCANCODE_9]) keyMatrix[1] &= ~0x02;
+    if (s[SDL_SCANCODE_MINUS]) keyMatrix[1] &= ~0x04;
+    if (s[SDL_SCANCODE_EQUALS]) keyMatrix[1] &= ~0x08;
+    if (s[SDL_SCANCODE_BACKSLASH]) keyMatrix[1] &= ~0x10;
+    if (s[SDL_SCANCODE_LEFTBRACKET]) keyMatrix[1] &= ~0x20;
+    if (s[SDL_SCANCODE_RIGHTBRACKET]) keyMatrix[1] &= ~0x40;
+    if (s[SDL_SCANCODE_SEMICOLON]) keyMatrix[1] &= ~0x80;
+    if (s[SDL_SCANCODE_APOSTROPHE]) keyMatrix[2] &= ~0x01;
+    if (s[SDL_SCANCODE_COMMA]) keyMatrix[2] &= ~0x04;
+    if (s[SDL_SCANCODE_PERIOD]) keyMatrix[2] &= ~0x08;
+    if (s[SDL_SCANCODE_SLASH]) keyMatrix[2] &= ~0x10;
+    if (s[SDL_SCANCODE_A]) keyMatrix[2] &= ~0x40;
+    if (s[SDL_SCANCODE_B]) keyMatrix[2] &= ~0x80;
+    if (s[SDL_SCANCODE_C]) keyMatrix[3] &= ~0x01;
+    if (s[SDL_SCANCODE_D]) keyMatrix[3] &= ~0x02;
+    if (s[SDL_SCANCODE_E]) keyMatrix[3] &= ~0x04;
+    if (s[SDL_SCANCODE_F]) keyMatrix[3] &= ~0x08;
+    if (s[SDL_SCANCODE_G]) keyMatrix[3] &= ~0x10;
+    if (s[SDL_SCANCODE_H]) keyMatrix[3] &= ~0x20;
+    if (s[SDL_SCANCODE_I]) keyMatrix[3] &= ~0x40;
+    if (s[SDL_SCANCODE_J]) keyMatrix[3] &= ~0x80;
+    if (s[SDL_SCANCODE_K]) keyMatrix[4] &= ~0x01;
+    if (s[SDL_SCANCODE_L]) keyMatrix[4] &= ~0x02;
+    if (s[SDL_SCANCODE_M]) keyMatrix[4] &= ~0x04;
+    if (s[SDL_SCANCODE_N]) keyMatrix[4] &= ~0x08;
+    if (s[SDL_SCANCODE_O]) keyMatrix[4] &= ~0x10;
+    if (s[SDL_SCANCODE_P]) keyMatrix[4] &= ~0x20;
+    if (s[SDL_SCANCODE_Q]) keyMatrix[4] &= ~0x40;
+    if (s[SDL_SCANCODE_R]) keyMatrix[4] &= ~0x80;
+    if (s[SDL_SCANCODE_S]) keyMatrix[5] &= ~0x01;
+    if (s[SDL_SCANCODE_T]) keyMatrix[5] &= ~0x02;
+    if (s[SDL_SCANCODE_U]) keyMatrix[5] &= ~0x04;
+    if (s[SDL_SCANCODE_V]) keyMatrix[5] &= ~0x08;
+    if (s[SDL_SCANCODE_W]) keyMatrix[5] &= ~0x10;
+    if (s[SDL_SCANCODE_X]) keyMatrix[5] &= ~0x20;
+    if (s[SDL_SCANCODE_Y]) keyMatrix[5] &= ~0x40;
+    if (s[SDL_SCANCODE_Z]) keyMatrix[5] &= ~0x80;
     if (s[SDL_SCANCODE_LSHIFT] || s[SDL_SCANCODE_RSHIFT]) keyMatrix[6] &= ~0x01;
     if (s[SDL_SCANCODE_LCTRL] || s[SDL_SCANCODE_RCTRL]) keyMatrix[6] &= ~0x02;
-    if (s[SDL_SCANCODE_LALT]) keyMatrix[6] &= ~0x04; if (s[SDL_SCANCODE_F1]) keyMatrix[6] &= ~0x20;
-    if (s[SDL_SCANCODE_F2]) keyMatrix[6] &= ~0x40; if (s[SDL_SCANCODE_F3]) keyMatrix[6] &= ~0x80;
-    if (s[SDL_SCANCODE_F4]) keyMatrix[7] &= ~0x01; if (s[SDL_SCANCODE_F5]) keyMatrix[7] &= ~0x02;
-    if (s[SDL_SCANCODE_ESCAPE]) keyMatrix[7] &= ~0x04; if (s[SDL_SCANCODE_TAB]) keyMatrix[7] &= ~0x08;
-    if (s[SDL_SCANCODE_BACKSPACE]) keyMatrix[7] &= ~0x20; if (s[SDL_SCANCODE_RETURN]) keyMatrix[7] &= ~0x80;
-    if (s[SDL_SCANCODE_SPACE]) keyMatrix[8] &= ~0x01; if (s[SDL_SCANCODE_HOME]) keyMatrix[8] &= ~0x02;
-    if (s[SDL_SCANCODE_INSERT]) keyMatrix[8] &= ~0x04; if (s[SDL_SCANCODE_DELETE]) keyMatrix[8] &= ~0x08;
-    if (s[SDL_SCANCODE_LEFT]) keyMatrix[8] &= ~0x10; if (s[SDL_SCANCODE_UP]) keyMatrix[8] &= ~0x20;
-    if (s[SDL_SCANCODE_DOWN]) keyMatrix[8] &= ~0x40; if (s[SDL_SCANCODE_RIGHT]) keyMatrix[8] &= ~0x80;
+    if (s[SDL_SCANCODE_LALT]) keyMatrix[6] &= ~0x04;
+    if (s[SDL_SCANCODE_F1]) keyMatrix[6] &= ~0x20;
+    if (s[SDL_SCANCODE_F2]) keyMatrix[6] &= ~0x40;
+    if (s[SDL_SCANCODE_F3]) keyMatrix[6] &= ~0x80;
+    if (s[SDL_SCANCODE_F4]) keyMatrix[7] &= ~0x01;
+    if (s[SDL_SCANCODE_F5]) keyMatrix[7] &= ~0x02;
+    if (s[SDL_SCANCODE_ESCAPE]) keyMatrix[7] &= ~0x04;
+    if (s[SDL_SCANCODE_TAB]) keyMatrix[7] &= ~0x08;
+    if (s[SDL_SCANCODE_BACKSPACE]) keyMatrix[7] &= ~0x20;
+    if (s[SDL_SCANCODE_RETURN]) keyMatrix[7] &= ~0x80;
+    if (s[SDL_SCANCODE_SPACE]) keyMatrix[8] &= ~0x01;
+    if (s[SDL_SCANCODE_HOME]) keyMatrix[8] &= ~0x02;
+    if (s[SDL_SCANCODE_INSERT]) keyMatrix[8] &= ~0x04;
+    if (s[SDL_SCANCODE_DELETE]) keyMatrix[8] &= ~0x08;
+    if (s[SDL_SCANCODE_LEFT]) keyMatrix[8] &= ~0x10;
+    if (s[SDL_SCANCODE_UP]) keyMatrix[8] &= ~0x20;
+    if (s[SDL_SCANCODE_DOWN]) keyMatrix[8] &= ~0x40;
+    if (s[SDL_SCANCODE_RIGHT]) keyMatrix[8] &= ~0x80;
 }
 
 void startEmulator() {
@@ -354,7 +386,11 @@ extern "C" void saveVramSc2(const char* filename) {
 
 void handleHLE(R800* cpu);
 
+#ifndef VERIFY_CORE
 int main(int argc, char* argv[]) {
+#else
+int main_emu(int argc, char* argv[]) {
+#endif
     const char* targetPath = "."; bool pathIsFile = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0) debugMode = true; else if (strcmp(argv[i], "-v") == 0) vramViewerMode = true; else targetPath = argv[i];

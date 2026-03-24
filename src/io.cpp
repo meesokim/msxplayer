@@ -9,7 +9,6 @@ typedef struct {
 } IoHandler;
 
 static IoHandler ioHandlers[256];
-static UInt8 primarySlot = 0x00;
 
 extern "C" void ioPortRegister(int port, IoPortRead read, IoPortWrite write, void* ref) {
     if (port >= 0 && port < 256) {
