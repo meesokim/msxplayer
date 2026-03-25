@@ -39,11 +39,11 @@ PSG_SRC = $(BLUE_MSX_SRC)/SoundChips/AY8910.c
 FB_SRC  = $(BLUE_MSX_SRC)/VideoChips/FrameBuffer.c
 
 # Our source files
-MY_OBJS = main.o video.o memory.o io.o sound.o stubs.o vram_viewer.o vdp_test.o bios_data.o
+MY_OBJS = main.o video.o memory.o io.o sound.o stubs.o vram_viewer.o vdp_test.o bios_data.o hash_util.o mapper_db.o
 BLUE_OBJS = VDP.o R800.o AY8910.o FrameBuffer.o Zip.o IoApi.o Adler32.o Crc32.o InfFast.o Inflate.o InfTrees.o Zutil.o
 OBJS = $(MY_OBJS) $(BLUE_OBJS)
 
-all: msxplay msxplay.exe verify
+all: msxplay msxplay.exe verify verify-tools
 
 msxplay: $(OBJS)
 	$(CXX) -o msxplay $(OBJS) $(LDFLAGS)
@@ -51,6 +51,9 @@ msxplay: $(OBJS)
 verify: src/verify_core.cpp
 	$(CXX) -o verify_core src/verify_core.cpp
 	./verify_core
+
+verify-tools: src/verify_tools.cpp src/hash_util.cpp src/mapper_db.cpp
+	$(CXX) -o verify_tools src/verify_tools.cpp src/hash_util.cpp src/mapper_db.cpp $(CXXFLAGS)
 
 main_verify.o: src/main.cpp
 	$(CXX) -c src/main.cpp -o main_verify.o $(CXXFLAGS) -DVERIFY_CORE

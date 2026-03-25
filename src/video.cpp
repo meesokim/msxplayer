@@ -82,6 +82,79 @@ extern UInt8 bios[0x8000];
 
 static UInt16 frameBuffer[272 * 240];
 
+/* Register mix key: same as blueberryMSX updateScreenMode() first switch (MSX1). */
+static int msx1RegMixKey(UInt8* regs) {
+    return ((regs[0] & 0x0e) >> 1) | (regs[1] & 0x18);
+}
+
+/*
+ * SCREEN 0 + 2 (mix key 0x11): VDP reports screenMode 0 but hardware uses
+ * RefreshLine0Plus — text layout (40 cols / 256px) + Graphics II pattern fetch.
+ * Drawing pure SCREEN 0 here causes wrong VRAM layout and vertical stripe artifacts.
+ * Ported from blueberryMSX Common.h RefreshLine0Plus (hScroll=0).
+ */
+static void renderMSX1Screen0Plus(UInt8* vram, UInt8* regs, UInt16 pfg, UInt16 pbg, int vramMask) {
+    const int chrTabBase = (((int)regs[2] << 10) | 0x3FF) & vramMask;
+    const int chrGenBase = (((int)regs[4] << 11) | 0x7FF) & vramMask;
+    const int ntOrMask = (int)(0xFFFFF000u); /* (-1<<12) */
+
+    for (int y = 0; y < 192; y++) {
+        const unsigned yu = (unsigned)y;
+        const int patternBase = (int)(0xFFFFE000u | ((yu & 0xC0u) << 5) | (yu & 7u));
+        int shift = 0;
+        int xChar = 0;
+        int patternByte = 0;
+        int dstOff = (y + 24) * 272 + 8;
+
+        for (int tileX = 0; tileX < 32; tileX++) {
+            if (tileX == 0 || tileX == 31) {
+                for (int p = 0; p < 8; p++)
+                    frameBuffer[dstOff++] = pbg;
+            } else {
+                for (int j = 0; j < 4; j++) {
+                    if (shift <= 2) {
+                        int charIdx = 0xC00 + 40 * (y / 8) + xChar++;
+                        int ntAddr = (chrTabBase & (ntOrMask | charIdx)) & vramMask;
+                        UInt8 code = vram[ntAddr];
+                        int pAddr = (chrGenBase & (patternBase | (code * 8))) & vramMask;
+                        patternByte = vram[pAddr];
+                        shift = 8;
+                    }
+                    int bit = (patternByte >> (--shift)) & 1;
+                    frameBuffer[dstOff++] = bit ? pfg : pbg;
+                    bit = (patternByte >> (--shift)) & 1;
+                    frameBuffer[dstOff++] = bit ? pfg : pbg;
+                }
+            }
+        }
+    }
+}
+
+/*
+ * SCREEN 3 (multicolor): vdp screenMode == 3. Was incorrectly drawn with the Screen 2 path
+ * (wrong VRAM layout → black or garbage). Ported from blueberryMSX Common.h RefreshLine3 (no sprites in cell).
+ */
+static void renderMSX1Screen3(UInt8* vram, UInt8* regs, UInt16* palette, int vramMask) {
+    const int chrTabBase = (((int)regs[2] << 10) | 0x3FF) & vramMask;
+    const int chrGenBase = (((int)regs[4] << 11) | 0x7FF) & vramMask;
+    const int ntRowMask = (int)(0xFFFFFC00u);   /* (-1<<10) */
+    const int patLineMask = (int)(0xFFFFF800u); /* (-1<<11) */
+
+    for (int y = 0; y < 192; y++) {
+        const int ntRow = (chrTabBase & (ntRowMask | (32 * (y / 8)))) & vramMask;
+        const int patternBase = (chrGenBase & (patLineMask | ((y >> 2) & 7))) & vramMask;
+        int dstOff = (y + 24) * 272 + 8;
+        for (int tx = 0; tx < 32; tx++) {
+            const UInt8 code = vram[(ntRow + tx) & vramMask];
+            const UInt8 colPat = vram[(patternBase | (code * 8)) & vramMask];
+            const UInt16 fc = palette[colPat >> 4];
+            const UInt16 bc = palette[colPat & 0x0F];
+            for (int p = 0; p < 4; p++) frameBuffer[dstOff++] = fc;
+            for (int p = 0; p < 4; p++) frameBuffer[dstOff++] = bc;
+        }
+    }
+}
+
 // Basic font renderer using BIOS font
 static void drawChar(int x, int y, char c, UInt16 fg, UInt16 bg, int w) {
     if (x < 0 || x > 272-w || y < 0 || y > 232) return;
@@ -164,10 +237,15 @@ extern "C" void RefreshScreen(int screenMode) {
     for (int i = 0; i < 272 * 240; i++) frameBuffer[i] = bgPixel;
 
     if (displayEnabled) {
-        if (mode == 0) { // Screen 0
+        const int mixKey = msx1RegMixKey(regs);
+        int fg = regs[7] >> 4, bg = regs[7] & 0x0F;
+        UInt16 pfg = palette[fg], pbg = palette[bg];
+
+        if (mode == 0 && mixKey == 0x11) {
+            /* SCREEN 0 + Graphics II (e.g. Alpha Roid title) */
+            renderMSX1Screen0Plus(vram, regs, pfg, pbg, vramMask);
+        } else if (mode == 0) { // Screen 0 only (mixKey 0x10)
             int nt = (regs[2] << 10) & vramMask, pb = (regs[4] << 11) & vramMask;
-            int fg = regs[7] >> 4, bg = regs[7] & 0x0F;
-            UInt16 pfg = palette[fg], pbg = palette[bg];
             for (int y = 0; y < 192; y++) {
                 int py = y % 8, row = (y / 8) * 40, dstOff = (y + 24) * 272 + 16;
                 for (int tx = 0; tx < 40; tx++) {
@@ -188,13 +266,15 @@ extern "C" void RefreshScreen(int screenMode) {
                     int code = vram[(nt + rowStart + tx) & vramMask];
                     UInt8 pat = vram[(pb + code * 8 + py) & vramMask];
                     UInt8 col = vram[(ct + code / 8) & vramMask];
-                    UInt16 pfg = palette[col >> 4 ? col >> 4 : bgCol];
-                    UInt16 pbg = palette[col & 0x0F ? col & 0x0F : bgCol];
+                    pfg = palette[col >> 4];
+                    pbg = palette[col & 0x0F];
                     for (int b = 0; b < 8; b++) {
                         frameBuffer[dstOff + tx * 8 + b] = (pat & (0x80 >> b)) ? pfg : pbg;
                     }
                 }
             }
+        } else if (mode == 3) { // Screen 3 multicolor (e.g. Bifamu)
+            renderMSX1Screen3(vram, regs, palette, vramMask);
         } else { // Screen 2
             int nt = (regs[2] << 10) & 0x3C00, pb = (regs[4] & 0x3C) << 11, pm = ((regs[4] & 0x03) << 11) | 0x7FF;
             int cb = (regs[3] & 0x80) << 6, cm = ((regs[3] & 0x7F) << 6) | 0x3F;
@@ -203,7 +283,7 @@ extern "C" void RefreshScreen(int screenMode) {
                 for (int tx = 0; tx < 32; tx++) {
                     int idx = zone | (vram[(nt + row + tx) & vramMask] << 3) | py;
                     UInt8 pat = vram[(pb | (idx & pm)) & vramMask], col = vram[(cb | (idx & cm)) & vramMask];
-                    UInt16 pfg = palette[col >> 4 ? col >> 4 : bgCol], pbg = palette[col & 0x0F ? col & 0x0F : bgCol];
+                    UInt16 pfg = palette[col >> 4], pbg = palette[col & 0x0F];
                     for (int b = 0; b < 8; b++) frameBuffer[dstOff + tx*8 + b] = (pat & (0x80 >> b)) ? pfg : pbg;
                 }
             }

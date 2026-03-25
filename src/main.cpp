@@ -1,4 +1,6 @@
 #include "msxplay.h"
+#include "hash_util.h"
+#include "mapper_db.h"
 #include "FrameBuffer.h"
 #include "unzip.h"
 #include "bios_data.h"
@@ -49,6 +51,8 @@ UInt8 primarySlot = 0x00;
 static int romSizeTotal = 0; // Renamed from romActualSize
 static AY8910* psg = NULL;
 static bool vdpCreated = false;
+static MapperDb g_mapperDb;
+static bool g_mapperDbTriedLoad = false;
 
 enum AppState { STATE_MENU, STATE_EMU };
 static AppState appState = STATE_MENU;
@@ -104,25 +108,82 @@ extern "C" {
 MapperType romMapper = MAPPER_NONE;
 int romBanks[4] = {0, 1, 2, 3};
 
+void startEmulator();
+
+static const char* kMapperDbPath = "mapper_db.csv";
+
+static void applyMegaRomHeuristic() {
+    int kWrite = 0;
+    int ascii8Write = 0;
+    int ascii16Write = 0;
+    for (int i = 0; i + 2 < romSize; ++i) {
+        if (romData[i] == 0x32) { // LD (nn),A
+            UInt16 a = (UInt16)romData[i + 1] | ((UInt16)romData[i + 2] << 8);
+            if (a == 0x6000 || a == 0x8000 || a == 0xA000) kWrite++;
+            if (a >= 0x6000 && a < 0x8000) ascii8Write++;
+            if (a == 0x6000 || a == 0x7000) ascii16Write++;
+        }
+    }
+    if (ascii8Write > kWrite + 2 && ascii8Write >= ascii16Write) romMapper = MAPPER_ASCII8;
+    else if (ascii16Write > kWrite + 2) romMapper = MAPPER_ASCII16;
+    else romMapper = MAPPER_KONAMI;
+}
+
 static void detectMapper() {
     romMapper = MAPPER_NONE;
     if (romSize <= 0x8000) return; // 32KB or less is not a MegaROM
-    
-    // Default to Konami
-    romMapper = MAPPER_KONAMI;
-    
-    // Heuristic: Check for 'AB' signature at 0x4000
-    if (romSize > 0x4000 && romData[0] == 'A' && romData[1] == 'B') {
-        // Many ASCII games also have 'AB' signature.
-        // Konami games often have specific strings.
-        // For now, Konami is a safe default for most MegaROMs.
+
+    if (!g_mapperDbTriedLoad) {
+        g_mapperDb.load(kMapperDbPath);
+        g_mapperDbTriedLoad = true;
     }
-    
-    // If ROM size is exactly 128KB or 256KB and not from Konami, 
-    // it *might* be ASCII8. This is a very rough heuristic.
-    // In a real emulator, we'd use a checksum database.
-    
+
+    const std::string sha1 = sha1Hex(romData, romSize);
+    MapperType mapped = MAPPER_NONE;
+    const bool dbHit = g_mapperDb.find(sha1, mapped);
+    if (dbHit && mapped != MAPPER_NONE) {
+        romMapper = mapped;
+        printf("detectMapper: SHA1 DB hit %s -> %s\n", sha1.c_str(), mapperTypeName(romMapper));
+        fflush(stdout);
+    } else {
+        /* DB miss, or CSV row NONE (build-mapper-db placeholder): mega ROM still needs a mapper */
+        applyMegaRomHeuristic();
+        if (dbHit)
+            printf("detectMapper: DB NONE for mega ROM %s -> heuristic %s\n", sha1.c_str(), mapperTypeName(romMapper));
+        else
+            printf("detectMapper: SHA1 DB miss %s -> heuristic %s\n", sha1.c_str(), mapperTypeName(romMapper));
+        fflush(stdout);
+    }
+
     romBanks[0] = 0; romBanks[1] = 1; romBanks[2] = 2; romBanks[3] = 3;
+}
+
+static void cycleMapperAndSoftReset() {
+    if (!romData || romSize <= 0x8000) {
+        printf("cycleMapper: MegaROM only (>32KB)\n");
+        fflush(stdout);
+        return;
+    }
+    static const MapperType order[] = {
+        MAPPER_KONAMI, MAPPER_KONAMI_SCC, MAPPER_ASCII8, MAPPER_ASCII16
+    };
+    const int n = (int)(sizeof(order) / sizeof(order[0]));
+    int idx = -1;
+    for (int i = 0; i < n; ++i) {
+        if (order[i] == romMapper) {
+            idx = i;
+            break;
+        }
+    }
+    idx = (idx + 1) % n;
+    romMapper = order[idx];
+    romBanks[0] = 0;
+    romBanks[1] = 1;
+    romBanks[2] = 2;
+    romBanks[3] = 3;
+    printf("cycleMapper+reset: mapper=%s (Ctrl+F5 cycles)\n", mapperTypeName(romMapper));
+    fflush(stdout);
+    startEmulator();
 }
 
 bool loadRom(const char* filename) {
@@ -179,11 +240,18 @@ UInt8 readMemory(void* ref, UInt16 address) {
                 }
             }
         } else {
-            // Konami, Konami SCC, ASCII8 (8KB banks)
+            // Konami, Konami SCC, ASCII8 (8KB banks), ASCII16 (16KB banks)
             if (address >= 0x4000 && address < 0xC000) {
-                int bankIdx = (address - 0x4000) / 0x2000;
-                int bank = romBanks[bankIdx];
-                int offset = (bank * 0x2000) + (address % 0x2000);
+                int offset = 0;
+                if (romMapper == MAPPER_ASCII16) {
+                    int bankIdx16 = (address < 0x8000) ? 0 : 1;
+                    int bank = romBanks[bankIdx16];
+                    offset = (bank * 0x4000) + (address % 0x4000);
+                } else {
+                    int bankIdx = (address - 0x4000) / 0x2000;
+                    int bank = romBanks[bankIdx];
+                    offset = (bank * 0x2000) + (address % 0x2000);
+                }
                 if (offset < romSize) return romData[offset];
             }
         }
@@ -198,19 +266,30 @@ void writeMemory(void* ref, UInt16 address, UInt8 value) {
 
     // First, handle mapper register writes, which are exceptions
     if ((slot == 1 || slot == 2) && romMapper != MAPPER_NONE) {
-        if (romMapper == MAPPER_KONAMI) {
+        if (romMapper == MAPPER_KONAMI || romMapper == MAPPER_KONAMI_SCC) {
             if (address == 0x6000 || address == 0x8000 || address == 0xA000) {
-                 if (address == 0x6000) romBanks[1] = value % (romSize / 0x2000);
-                 else if (address == 0x8000) romBanks[2] = value % (romSize / 0x2000);
-                 else if (address == 0xA000) romBanks[3] = value % (romSize / 0x2000);
+                 int nb8 = romSize / 0x2000;
+                 if (nb8 < 1) nb8 = 1;
+                 if (address == 0x6000) romBanks[1] = value % nb8;
+                 else if (address == 0x8000) romBanks[2] = value % nb8;
+                 else if (address == 0xA000) romBanks[3] = value % nb8;
                  return;
+            }
+        } else if (romMapper == MAPPER_ASCII16) {
+            if (address >= 0x6000 && address < 0x7800) {
+                if (address < 0x7000) romBanks[0] = value % (romSize / 0x4000);
+                else romBanks[1] = value % (romSize / 0x4000);
+                return;
             }
         } else if (romMapper == MAPPER_ASCII8) {
             if (address >= 0x6000 && address < 0x8000) {
-                if (address >= 0x6000 && address < 0x6800) romBanks[0] = value;
-                else if (address >= 0x6800 && address < 0x7000) romBanks[1] = value;
-                else if (address >= 0x7000 && address < 0x7800) romBanks[2] = value;
-                else if (address >= 0x7800 && address < 0x8000) romBanks[3] = value;
+                int nb8 = romSize / 0x2000;
+                if (nb8 < 1) nb8 = 1;
+                int v = value % nb8;
+                if (address >= 0x6000 && address < 0x6800) romBanks[0] = v;
+                else if (address >= 0x6800 && address < 0x7000) romBanks[1] = v;
+                else if (address >= 0x7000 && address < 0x7800) romBanks[2] = v;
+                else if (address >= 0x7800 && address < 0x8000) romBanks[3] = v;
                 return;
             }
         }
@@ -413,7 +492,7 @@ int main_emu(int argc, char* argv[]) {
         }
     }
     bool quit = false, fullscreen = false; SDL_Event e; Uint32 lastTime = SDL_GetTicks();
-    printf("main: Entering main loop.\n"); fflush(stdout);
+    printf("main: Entering main loop. Ctrl+F5=next mapper+reset  F12=save mapper to mapper_db.csv\n"); fflush(stdout);
     while (!quit) {
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) quit = true;
@@ -452,6 +531,21 @@ int main_emu(int argc, char* argv[]) {
                     if (e.key.keysym.sym == SDLK_F7) { if (!romFiles.empty()) appState = STATE_MENU; else startEmulator(); }
                     if (e.key.keysym.sym == SDLK_F8) scanlinesEnabled = !scanlinesEnabled;
                     if (e.key.keysym.sym == SDLK_PRINTSCREEN) { saveVramSc2("capture.sc2"); saveScreenshot("capture.bmp"); }
+                    if (e.key.keysym.sym == SDLK_F5 && (e.key.keysym.mod & KMOD_CTRL)) cycleMapperAndSoftReset();
+                    if (e.key.keysym.sym == SDLK_F12 && romData) {
+                        if (!g_mapperDbTriedLoad) {
+                            g_mapperDb.load(kMapperDbPath);
+                            g_mapperDbTriedLoad = true;
+                        }
+                        std::string sha1 = sha1Hex(romData, romSize);
+                        if (g_mapperDb.upsert(kMapperDbPath, sha1, romMapper)) {
+                            g_mapperDb.load(kMapperDbPath);
+                            printf("mapper_db: saved %s -> %s\n", sha1.c_str(), mapperTypeName(romMapper));
+                        } else {
+                            printf("mapper_db: failed to write %s\n", kMapperDbPath);
+                        }
+                        fflush(stdout);
+                    }
                 }
             }
         }
