@@ -39,7 +39,17 @@ void boardTimerDestroy(void* timer);
 }
 #endif
 
-enum MapperType { MAPPER_NONE, MAPPER_KONAMI, MAPPER_KONAMI_SCC, MAPPER_ASCII8, MAPPER_ASCII16 };
+enum MapperType {
+    MAPPER_NONE,
+    MAPPER_KONAMI,
+    MAPPER_KONAMI_SCC,
+    MAPPER_ASCII8,
+    MAPPER_ASCII8_SRAM2,
+    MAPPER_ASCII16,
+    MAPPER_MIRRORED,
+    /** openMSX RomType PAGE2: ROM only at 8000h–BFFFh (16 KiB window). */
+    MAPPER_PAGE2
+};
 extern MapperType romMapper;
 extern int romBanks[4];
 

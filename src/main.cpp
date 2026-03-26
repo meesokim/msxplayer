@@ -1,6 +1,7 @@
 #include "msxplay.h"
 #include "hash_util.h"
 #include "mapper_db.h"
+#include "bios_loader.h"
 #include "FrameBuffer.h"
 #include "unzip.h"
 #include "bios_data.h"
@@ -9,6 +10,7 @@
 #include <string.h>
 #include <vector>
 #include <string>
+#include <unordered_set>
 #include <algorithm>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -29,6 +31,7 @@ extern "C" {
     UInt8 readIoPort(void* ref, UInt16 address);
     void  writeIoPort(void* ref, UInt16 address, UInt8 value);
     UInt8* vdpGetVramPtr();
+    void ay8910Reset(AY8910*);
     void ay8910WriteAddress(AY8910*, UInt16, UInt8);
     void ay8910WriteData(AY8910*, UInt16, UInt8);
     UInt8 ay8910ReadData(AY8910*, UInt16);
@@ -38,17 +41,17 @@ extern "C" {
 extern void initVideo();
 extern void initSound();
 extern "C" void RefreshScreen(int);
-extern "C" void DrawMenu(const std::vector<std::string>& files, int selected, int offset);
+extern "C" void DrawMenu(const std::vector<std::string>& files, int selected, int offset, int biosMode, int fontEjk);
 extern "C" void* ioPortGetRef(int port);
 extern "C" void saveScreenshot(const char* filename);
 extern "C" void updateSound();
+extern "C" void clearQueuedAudio(void);
 extern "C" SDL_Window* getMainWindow();
 
 bool debugMode = false;
 bool vramViewerMode = false;
 bool scanlinesEnabled = true;
-UInt8 primarySlot = 0x00; 
-static int romSizeTotal = 0; // Renamed from romActualSize
+UInt8 primarySlot = 0x00;
 static AY8910* psg = NULL;
 static bool vdpCreated = false;
 static MapperDb g_mapperDb;
@@ -112,6 +115,46 @@ void startEmulator();
 
 static const char* kMapperDbPath = "mapper_db.csv";
 
+/** ASCII8SRAM2 (openMSX RomAscii8_8 / ASCII8_2): 2 KiB SRAM at 0x8000–0xBFFF when enabled. */
+static const size_t kAscii8Sram2Size = 0x800;
+static UInt8 g_a8s2[kAscii8Sram2Size];
+static UInt8 g_a8s2_enable; /* bits: Z80 8 KiB region index (address>>13) */
+static UInt8 g_a8s2_block[8];
+
+static void resetAscii8Sram2Storage(void) {
+    memset(g_a8s2, 0, sizeof(g_a8s2));
+    g_a8s2_enable = 0;
+    memset(g_a8s2_block, 0, sizeof(g_a8s2_block));
+}
+
+/** Menu defaults (also used when ROM has no DB row). 0=emb 1=C-BIOS+basic 2=VG8020 3=main+logo */
+static unsigned char menuBiosMode = 0;
+static char menuFont = 'e';
+/** Active session: applied in startEmulator and saved with F12. */
+static unsigned char g_biosMode = 0;
+static char g_romFont = 'e';
+static std::string g_romSearchBase = ".";
+/** Per-ROM SHA1: DB basic/font applied only on first load with a row; later loads use menu (B / E J K). */
+static std::unordered_set<std::string> g_basicFontDbHydratedSha1;
+
+static void applyMenuOrDbBasicFont(const std::string& sha1, bool haveProf, const RomDbProfile& prof) {
+    if (haveProf) {
+        if (g_basicFontDbHydratedSha1.find(sha1) == g_basicFontDbHydratedSha1.end()) {
+            g_basicFontDbHydratedSha1.insert(sha1);
+            g_biosMode = prof.biosMode;
+            g_romFont = prof.font;
+            menuBiosMode = prof.biosMode;
+            menuFont = prof.font;
+        } else {
+            g_biosMode = menuBiosMode;
+            g_romFont = menuFont;
+        }
+    } else {
+        g_biosMode = menuBiosMode;
+        g_romFont = menuFont;
+    }
+}
+
 static void applyMegaRomHeuristic() {
     int kWrite = 0;
     int ascii8Write = 0;
@@ -129,9 +172,23 @@ static void applyMegaRomHeuristic() {
     else romMapper = MAPPER_KONAMI;
 }
 
+/** openMSX "Mirrored" plain ROM: 8 KiB blocks from 0x4000, tile across 0x4000–0xBFFF (no mapper regs). */
+static UInt8 readMirroredRomAt4000(UInt16 address) {
+    if (!romData || address < 0x4000 || address >= 0xC000) return 0xFF;
+    const unsigned region = ((unsigned)address >> 13);
+    const unsigned firstPage = 2; /* base 0x4000 */
+    unsigned num8k = (unsigned)(romSize / 0x2000);
+    if (num8k < 1) num8k = 1;
+    unsigned romPage = region - firstPage;
+    unsigned block = (romPage < num8k) ? romPage : (romPage % num8k);
+    unsigned off = block * 0x2000u + (address & 0x1FFFu);
+    if (off < (unsigned)romSize) return romData[off];
+    return 0xFF;
+}
+
 static void detectMapper() {
     romMapper = MAPPER_NONE;
-    if (romSize <= 0x8000) return; // 32KB or less is not a MegaROM
+    resetAscii8Sram2Storage();
 
     if (!g_mapperDbTriedLoad) {
         g_mapperDb.load(kMapperDbPath);
@@ -139,35 +196,74 @@ static void detectMapper() {
     }
 
     const std::string sha1 = sha1Hex(romData, romSize);
-    MapperType mapped = MAPPER_NONE;
-    const bool dbHit = g_mapperDb.find(sha1, mapped);
-    if (dbHit && mapped != MAPPER_NONE) {
-        romMapper = mapped;
-        printf("detectMapper: SHA1 DB hit %s -> %s\n", sha1.c_str(), mapperTypeName(romMapper));
+    RomDbProfile prof;
+    const bool haveProf = g_mapperDb.findProfile(sha1, prof);
+
+    if (romSize <= 0x8000) {
+        if (haveProf && prof.mapper != MAPPER_NONE)
+            romMapper = prof.mapper;
+        else if (romSize <= 0x4000 && romData[0] == 'A' && romData[1] == 'B') {
+            /* openMSX RomFactory: PAGE2 cartridge (e.g. Exchanger) — ROM at 8000h only */
+            UInt16 initAddr = (UInt16)romData[2] | ((UInt16)romData[3] << 8);
+            UInt16 textAddr = (UInt16)romData[8] | ((UInt16)romData[9] << 8);
+            if ((textAddr & 0xC000) == 0x8000) {
+                if (initAddr == 0 ||
+                    (((initAddr & 0xC000) == 0x8000) &&
+                     romSize > 0 && romData[initAddr & (romSize - 1)] == 0xC9))
+                    romMapper = MAPPER_PAGE2;
+            }
+        }
+
+        applyMenuOrDbBasicFont(sha1, haveProf, prof);
+        romBanks[0] = 0;
+        romBanks[1] = 1;
+        romBanks[2] = 2;
+        romBanks[3] = 3;
+        if (romMapper != MAPPER_NONE)
+            printf("detectMapper: <=32KiB ROM %s -> %s\n", sha1.c_str(), mapperTypeName(romMapper));
+        fflush(stdout);
+        return;
+    }
+
+    if (haveProf && prof.mapper != MAPPER_NONE) {
+        romMapper = prof.mapper;
+        printf("detectMapper: SHA1 DB hit %s -> %s bios=%u font=%c\n", sha1.c_str(), mapperTypeName(romMapper),
+               (unsigned)prof.biosMode, prof.font);
         fflush(stdout);
     } else {
-        /* DB miss, or CSV row NONE (build-mapper-db placeholder): mega ROM still needs a mapper */
         applyMegaRomHeuristic();
-        if (dbHit)
-            printf("detectMapper: DB NONE for mega ROM %s -> heuristic %s\n", sha1.c_str(), mapperTypeName(romMapper));
+        if (haveProf)
+            printf("detectMapper: DB mapper NONE for mega ROM %s -> heuristic %s\n", sha1.c_str(), mapperTypeName(romMapper));
         else
             printf("detectMapper: SHA1 DB miss %s -> heuristic %s\n", sha1.c_str(), mapperTypeName(romMapper));
         fflush(stdout);
     }
 
-    romBanks[0] = 0; romBanks[1] = 1; romBanks[2] = 2; romBanks[3] = 3;
+    applyMenuOrDbBasicFont(sha1, haveProf, prof);
+
+    romBanks[0] = 0;
+    romBanks[1] = 1;
+    romBanks[2] = 2;
+    romBanks[3] = 3;
 }
 
 static void cycleMapperAndSoftReset() {
-    if (!romData || romSize <= 0x8000) {
-        printf("cycleMapper: MegaROM only (>32KB)\n");
-        fflush(stdout);
-        return;
-    }
-    static const MapperType order[] = {
-        MAPPER_KONAMI, MAPPER_KONAMI_SCC, MAPPER_ASCII8, MAPPER_ASCII16
+    if (!romData) return;
+
+    static const MapperType orderMega[] = {
+        MAPPER_KONAMI, MAPPER_KONAMI_SCC, MAPPER_ASCII8, MAPPER_ASCII8_SRAM2, MAPPER_ASCII16, MAPPER_MIRRORED
     };
-    const int n = (int)(sizeof(order) / sizeof(order[0]));
+    static const MapperType orderSmall[] = { MAPPER_NONE, MAPPER_PAGE2, MAPPER_MIRRORED };
+
+    const MapperType* order;
+    int n;
+    if (romSize <= 0x8000) {
+        order = orderSmall;
+        n = (int)(sizeof(orderSmall) / sizeof(orderSmall[0]));
+    } else {
+        order = orderMega;
+        n = (int)(sizeof(orderMega) / sizeof(orderMega[0]));
+    }
     int idx = -1;
     for (int i = 0; i < n; ++i) {
         if (order[i] == romMapper) {
@@ -200,9 +296,20 @@ bool loadRom(const char* filename) {
                 if (unzOpenCurrentFile(uf) != UNZ_OK) break;
                 romSize = info.uncompressed_size;
                 romData = (UInt8*)malloc(romSize);
-                unzReadCurrentFile(uf, romData, romSize);
-                unzCloseCurrentFile(uf); unzClose(uf);
+                int zread = unzReadCurrentFile(uf, romData, romSize);
+                unzCloseCurrentFile(uf);
+                unzClose(uf);
+                if (zread != romSize) {
+                    free(romData);
+                    romData = NULL;
+                    return false;
+                }
                 detectMapper();
+                {
+                    std::string fn = filename;
+                    size_t slash = fn.find_last_of("/\\");
+                    g_romSearchBase = (slash == std::string::npos) ? std::string(".") : fn.substr(0, slash);
+                }
                 return true;
             }
         } while (unzGoToNextFile(uf) == UNZ_OK);
@@ -211,8 +318,19 @@ bool loadRom(const char* filename) {
         FILE* f = fopen(filename, "rb"); if (!f) return false;
         fseek(f, 0, SEEK_END); romSize = ftell(f); fseek(f, 0, SEEK_SET);
         romData = (UInt8*)malloc(romSize);
-        fread(romData, 1, romSize, f); fclose(f);
+        size_t nread = fread(romData, 1, (size_t)romSize, f);
+        fclose(f);
+        if (nread != (size_t)romSize) {
+            free(romData);
+            romData = NULL;
+            return false;
+        }
         detectMapper();
+        {
+            std::string fn = filename;
+            size_t slash = fn.find_last_of("/\\");
+            g_romSearchBase = (slash == std::string::npos) ? std::string(".") : fn.substr(0, slash);
+        }
         printf("loadRom: Loaded '%s', size=%d, mapper=%d\n", filename, romSize, romMapper); fflush(stdout);
         return true;
     }
@@ -228,6 +346,13 @@ UInt8 readMemory(void* ref, UInt16 address) {
     }
     if (slot == 1 || slot == 2) {
         if (!romData) return 0xFF;
+        if (romMapper == MAPPER_PAGE2) {
+            if (address >= 0x8000 && address < 0xC000) {
+                unsigned off = (unsigned)(address - 0x8000);
+                if (off < 0x4000u && off < (unsigned)romSize) return romData[off];
+            }
+            return 0xFF;
+        }
         if (romMapper == MAPPER_NONE) {
             bool startsAtZero = ((primarySlot & 0x03) == 0x01);
             if (startsAtZero) {
@@ -239,9 +364,20 @@ UInt8 readMemory(void* ref, UInt16 address) {
                     if (off < romSize) return romData[off];
                 }
             }
+        } else if (romMapper == MAPPER_MIRRORED) {
+            if (address >= 0x4000 && address < 0xC000) return readMirroredRomAt4000(address);
         } else {
-            // Konami, Konami SCC, ASCII8 (8KB banks), ASCII16 (16KB banks)
+            // Konami, Konami SCC, ASCII8 / ASCII8SRAM2 (8KB banks), ASCII16 (16KB banks)
             if (address >= 0x4000 && address < 0xC000) {
+                if (romMapper == MAPPER_ASCII8_SRAM2) {
+                    unsigned zbank = (unsigned)address >> 13;
+                    if (g_a8s2_enable & (1u << zbank)) {
+                        unsigned off = (unsigned)g_a8s2_block[zbank] * 0x2000u;
+                        off += ((unsigned)address & 0x1FFFu) & (kAscii8Sram2Size - 1);
+                        if (off < kAscii8Sram2Size) return g_a8s2[off];
+                        return 0xFF;
+                    }
+                }
                 int offset = 0;
                 if (romMapper == MAPPER_ASCII16) {
                     int bankIdx16 = (address < 0x8000) ? 0 : 1;
@@ -281,17 +417,45 @@ void writeMemory(void* ref, UInt16 address, UInt8 value) {
                 else romBanks[1] = value % (romSize / 0x4000);
                 return;
             }
-        } else if (romMapper == MAPPER_ASCII8) {
+        } else if (romMapper == MAPPER_ASCII8 || romMapper == MAPPER_ASCII8_SRAM2) {
             if (address >= 0x6000 && address < 0x8000) {
                 int nb8 = romSize / 0x2000;
                 if (nb8 < 1) nb8 = 1;
-                int v = value % nb8;
-                if (address >= 0x6000 && address < 0x6800) romBanks[0] = v;
-                else if (address >= 0x6800 && address < 0x7000) romBanks[1] = v;
-                else if (address >= 0x7000 && address < 0x7800) romBanks[2] = v;
-                else if (address >= 0x7800 && address < 0x8000) romBanks[3] = v;
+                int reg = (address >> 11) & 3;
+                if (romMapper == MAPPER_ASCII8_SRAM2) {
+                    /* openMSX RomAscii8_8 SubType::ASCII8_2 */
+                    UInt8 sramBit = (UInt8)((unsigned)romSize / 0x2000u);
+                    if (sramBit == 0) sramBit = 1;
+                    int region = reg + 2;
+                    const UInt8 sramPages = 0x30; /* only 0x8000–0xBFFF */
+                    UInt8 blkMask = (UInt8)((kAscii8Sram2Size + 0x1FFFu) / 0x2000u - 1);
+                    if (value & sramBit) {
+                        g_a8s2_enable |= (UInt8)((1 << region) & sramPages);
+                        g_a8s2_block[region] = (UInt8)(value & blkMask);
+                    } else {
+                        g_a8s2_enable &= (UInt8)~(1 << region);
+                        romBanks[reg] = (int)((unsigned)value % (unsigned)nb8);
+                    }
+                } else {
+                    int v = (int)((unsigned)value % (unsigned)nb8);
+                    if (address >= 0x6000 && address < 0x6800) romBanks[0] = v;
+                    else if (address >= 0x6800 && address < 0x7000) romBanks[1] = v;
+                    else if (address >= 0x7000 && address < 0x7800) romBanks[2] = v;
+                    else if (address >= 0x7800 && address < 0x8000) romBanks[3] = v;
+                }
                 return;
             }
+        }
+    }
+
+    if ((slot == 1 || slot == 2) && romMapper == MAPPER_ASCII8_SRAM2 && address >= 0x4000 && address < 0xC000 &&
+        (address < 0x6000 || address >= 0x8000)) {
+        unsigned zbank = (unsigned)address >> 13;
+        if (g_a8s2_enable & (1u << zbank)) {
+            unsigned off = (unsigned)g_a8s2_block[zbank] * 0x2000u;
+            off += ((unsigned)address & 0x1FFFu) & (kAscii8Sram2Size - 1);
+            if (off < kAscii8Sram2Size) g_a8s2[off] = value;
+            return;
         }
     }
 
@@ -328,8 +492,10 @@ static UInt8 psgRead(void* arg, UInt16 port) {
     if (port == 0) { // Port A (Joystick)
         UInt8 val = 0x3F; const Uint8* s = SDL_GetKeyboardState(NULL);
         if (!(psgPortB & 0x40)) {
-            if (s[SDL_SCANCODE_UP]) val &= ~0x01; if (s[SDL_SCANCODE_DOWN]) val &= ~0x02;
-            if (s[SDL_SCANCODE_LEFT]) val &= ~0x04; if (s[SDL_SCANCODE_RIGHT]) val &= ~0x08;
+            if (s[SDL_SCANCODE_UP]) val &= ~0x01;
+            if (s[SDL_SCANCODE_DOWN]) val &= ~0x02;
+            if (s[SDL_SCANCODE_LEFT]) val &= ~0x04;
+            if (s[SDL_SCANCODE_RIGHT]) val &= ~0x08;
             if (s[SDL_SCANCODE_SPACE] || s[SDL_SCANCODE_Z]) val &= ~0x10;
             if (s[SDL_SCANCODE_X] || s[SDL_SCANCODE_LSHIFT]) val &= ~0x20;
         }
@@ -411,14 +577,36 @@ void updateKeyboard() {
     if (s[SDL_SCANCODE_RIGHT]) keyMatrix[8] &= ~0x80;
 }
 
+/* VRAM + audio only: zeroing VDP regs desyncs core caches; zeroing palette makes every color black. */
+static void clearVideoAndAudioOnReset(void) {
+    UInt8* vram = vdpGetVramPtr();
+    if (vram) memset(vram, 0, 0x4000);
+    if (psg) ay8910Reset(psg);
+    clearQueuedAudio();
+}
+
 void startEmulator() {
     if (!vdpCreated) { vdpCreate(VDP_MSX, VDP_TMS99x8A, VDP_SYNC_60HZ, 1); vdpCreated = true; }
     if (!psg) { psg = ay8910Create(NULL, AY8910_MSX, PSGTYPE_AY8910, 0, NULL); ay8910SetIoPort(psg, (AY8910ReadCb)psgRead, (AY8910ReadCb)psgRead, (AY8910WriteCb)psgWrite, NULL); }
     memset(ram, 0, sizeof(ram));
+    {
+        std::vector<std::string> dirs;
+        dirs.push_back(".");
+        if (!g_romSearchBase.empty()) {
+            dirs.push_back(g_romSearchBase);
+            dirs.push_back(g_romSearchBase + "/bios");
+            dirs.push_back(g_romSearchBase + "/MSX1");
+        }
+        dirs.push_back("bios");
+        dirs.push_back("MSX1");
+        biosLoaderApply(g_biosMode, g_romFont, dirs);
+    }
     ioPortRegister(0xA0, NULL, (IoPortWrite)myPsgWriteAddr, psg); ioPortRegister(0xA1, NULL, (IoPortWrite)ay8910WriteData, psg); ioPortRegister(0xA2, (IoPortRead)ay8910ReadData, NULL, psg);
     ioPortRegister(0xA9, (IoPortRead)keyboardRead, NULL, NULL); ioPortRegister(0xAA, NULL, (IoPortWrite)keyboardWrite, NULL);
+    clearVideoAndAudioOnReset();
     if (!cpu) cpu = r800Create(0, (R800ReadCb)readMemory, (R800WriteCb)writeMemory, (R800ReadCb)r800ReadIo, (R800WriteCb)r800WriteIo, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
     r800Reset(cpu, 0);
+    if (romMapper == MAPPER_ASCII8_SRAM2) g_a8s2_enable = 0;
     if (romData) {
         if (romMapper == MAPPER_NONE) {
             bool mapFromZero = false;
@@ -436,13 +624,17 @@ void startEmulator() {
             } else { // Standard ROM at 0x4000
                 primarySlot = 0xD4;
             }
-        } else { // Mapped ROMs
-            primarySlot = 0xD4; // Most mappers use 0x4000-0xBFFF
+        } else if (romMapper == MAPPER_PAGE2) {
+            /* P0,P1=slot0 BIOS; P2=slot1 cart @8000h; P3=RAM (openMSX PAGE2 layout) */
+            primarySlot = 0xD0;
+        } else { // Mapped ROMs at 4000h
+            primarySlot = 0xD4;
         }
     } else {
         primarySlot = 0x00;
     }
     printf("startEmulator: primarySlot set to 0x%02X\n", primarySlot); fflush(stdout);
+    RefreshScreen(0);
 }
 
 static std::vector<std::string> scanDirectory(const char* path) {
@@ -477,6 +669,7 @@ int main_emu(int argc, char* argv[]) {
     struct stat st; if (stat(targetPath, &st) == 0 && S_ISREG(st.st_mode)) pathIsFile = true;
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_AUDIO) < 0) return 1;
     initVideo(); initSound();
+    biosLoaderInit();
     std::vector<std::string> romFiles; int menuSel = 0, menuOff = 0; std::string baseDir = targetPath;
     if (pathIsFile) { if (loadRom(targetPath)) { startEmulator(); appState = STATE_EMU; } }
     else {
@@ -492,7 +685,7 @@ int main_emu(int argc, char* argv[]) {
         }
     }
     bool quit = false, fullscreen = false; SDL_Event e; Uint32 lastTime = SDL_GetTicks();
-    printf("main: Entering main loop. Ctrl+F5=next mapper+reset  F12=save mapper to mapper_db.csv\n"); fflush(stdout);
+    printf("main: B=cycle BIOS emb/C-BIOS+basic/VG8020/main+logo  J/K force file BIOS  Ctrl+F5  F12=db\n"); fflush(stdout);
     while (!quit) {
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) quit = true;
@@ -509,8 +702,16 @@ int main_emu(int argc, char* argv[]) {
                     else if (e.key.keysym.sym == SDLK_RETURN) {
                         std::string full = baseDir + "/" + romFiles[menuSel];
                         if (loadRom(full.c_str())) { saveLastGame(romFiles[menuSel].c_str()); startEmulator(); appState = STATE_EMU; }
+                    } else if (e.key.keysym.sym == SDLK_b && !(e.key.keysym.mod & KMOD_CTRL)) {
+                        menuBiosMode = (unsigned char)((menuBiosMode + 1) % 4);
+                    } else if (e.key.keysym.sym == SDLK_e && !(e.key.keysym.mod & KMOD_CTRL)) {
+                        menuFont = 'e';
+                    } else if (e.key.keysym.sym == SDLK_j && !(e.key.keysym.mod & KMOD_CTRL)) {
+                        menuFont = 'j';
+                    } else if (e.key.keysym.sym == SDLK_k && !(e.key.keysym.mod & KMOD_CTRL)) {
+                        menuFont = 'k';
                     } else if (e.key.keysym.sym == SDLK_c && (e.key.keysym.mod & KMOD_CTRL)) {
-                        if (!romFiles.empty() && menuSel >= 0 && menuSel < romFiles.size()) {
+                        if (!romFiles.empty() && menuSel >= 0 && menuSel < (int)romFiles.size()) {
                             std::string full = baseDir + "/" + romFiles[menuSel];
 #ifdef _WIN32
                             char resolved_path[MAX_PATH];
@@ -525,8 +726,10 @@ int main_emu(int argc, char* argv[]) {
 #endif
                         }
                     }
-                    if (menuSel < 0) menuSel = 0; if (menuSel >= (int)romFiles.size()) menuSel = (int)romFiles.size() - 1;
-                    if (menuSel < menuOff) menuOff = menuSel; if (menuSel >= menuOff + pageSize) menuOff = menuSel - pageSize + 1;
+                    if (menuSel < 0) menuSel = 0;
+                    if (menuSel >= (int)romFiles.size()) menuSel = (int)romFiles.size() - 1;
+                    if (menuSel < menuOff) menuOff = menuSel;
+                    if (menuSel >= menuOff + pageSize) menuOff = menuSel - pageSize + 1;
                 } else {
                     if (e.key.keysym.sym == SDLK_F7) { if (!romFiles.empty()) appState = STATE_MENU; else startEmulator(); }
                     if (e.key.keysym.sym == SDLK_F8) scanlinesEnabled = !scanlinesEnabled;
@@ -538,9 +741,14 @@ int main_emu(int argc, char* argv[]) {
                             g_mapperDbTriedLoad = true;
                         }
                         std::string sha1 = sha1Hex(romData, romSize);
-                        if (g_mapperDb.upsert(kMapperDbPath, sha1, romMapper)) {
+                        RomDbProfile saveProf;
+                        saveProf.mapper = romMapper;
+                        saveProf.biosMode = g_biosMode;
+                        saveProf.font = g_romFont;
+                        if (g_mapperDb.upsertProfile(kMapperDbPath, sha1, saveProf)) {
                             g_mapperDb.load(kMapperDbPath);
-                            printf("mapper_db: saved %s -> %s\n", sha1.c_str(), mapperTypeName(romMapper));
+                            printf("mapper_db: saved %s -> %s bios=%u font=%c\n", sha1.c_str(), mapperTypeName(romMapper),
+                                   (unsigned)g_biosMode, g_romFont);
                         } else {
                             printf("mapper_db: failed to write %s\n", kMapperDbPath);
                         }
@@ -560,7 +768,11 @@ int main_emu(int argc, char* argv[]) {
                 }
                 RefreshScreen(0); updateSound(); lastTime = now;
             } else SDL_Delay(1);
-        } else { DrawMenu(romFiles, menuSel, menuOff); SDL_Delay(16); }
+        } else {
+            int fk = (menuFont == 'j') ? 1 : (menuFont == 'k' ? 2 : 0);
+            DrawMenu(romFiles, menuSel, menuOff, (int)menuBiosMode, fk);
+            SDL_Delay(16);
+        }
     }
     SDL_Quit(); return 0;
 }

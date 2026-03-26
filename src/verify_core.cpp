@@ -8,7 +8,7 @@ typedef unsigned char UInt8;
 typedef unsigned short UInt16;
 typedef unsigned int UInt32;
 
-enum MapperType { MAPPER_NONE, MAPPER_KONAMI, MAPPER_KONAMI_SCC, MAPPER_ASCII8, MAPPER_ASCII16 };
+enum MapperType { MAPPER_NONE, MAPPER_KONAMI, MAPPER_KONAMI_SCC, MAPPER_ASCII8, MAPPER_ASCII8_SRAM2, MAPPER_ASCII16, MAPPER_MIRRORED, MAPPER_PAGE2 };
 
 // Mocking required state
 UInt8 ram[0x10000];
@@ -18,6 +18,19 @@ MapperType romMapper = MAPPER_NONE;
 int romBanks[4] = {0, 1, 2, 3};
 UInt8 primarySlot = 0;
 UInt8 bios[0x8000];
+
+static UInt8 readMirroredRomAt4000(UInt16 address) {
+    if (!romData || address < 0x4000 || address >= 0xC000) return 0xFF;
+    const unsigned region = ((unsigned)address >> 13);
+    const unsigned firstPage = 2;
+    unsigned num8k = (unsigned)(romSize / 0x2000);
+    if (num8k < 1) num8k = 1;
+    unsigned romPage = region - firstPage;
+    unsigned block = (romPage < num8k) ? romPage : (romPage % num8k);
+    unsigned off = block * 0x2000u + (address & 0x1FFFu);
+    if (off < (unsigned)romSize) return romData[off];
+    return 0xFF;
+}
 
 // Logic under test (copied from main.cpp to be standalone)
 UInt8 readMemory(void* ref, UInt16 address) {
@@ -32,6 +45,8 @@ UInt8 readMemory(void* ref, UInt16 address) {
                 if (romSize <= 0x4000) off &= 0x3FFF;
                 if (off < romSize) return romData[off];
             }
+        } else if (romMapper == MAPPER_MIRRORED) {
+            if (address >= 0x4000 && address < 0xC000) return readMirroredRomAt4000(address);
         } else {
             if (address >= 0x4000 && address < 0xC000) {
                 int bankIdx = (address - 0x4000) / 0x2000;
@@ -116,6 +131,26 @@ void test_mapper_ascii8() {
     printf("OK\n");
 }
 
+void test_mapper_mirrored() {
+    printf("Testing Mirrored (plain) ROM... ");
+    romSize = 0x4000; /* 16 KiB -> 2x8K, tiles over 0x4000-0xBFFF */
+    romData = (UInt8*)malloc(romSize);
+    memset(romData, 0, romSize);
+    romData[0] = 0xAA;           /* first byte of 8K block 0 */
+    romData[0x2000] = 0xBB;      /* first byte of 8K block 1 */
+    romMapper = MAPPER_MIRRORED;
+    primarySlot = 0x14;
+
+    assert(readMemory(NULL, 0x4000) == 0xAA);
+    assert(readMemory(NULL, 0x6000) == 0xBB);
+    /* 0x8000 is third 8K window -> mirror block 0 */
+    assert(readMemory(NULL, 0x8000) == 0xAA);
+    assert(readMemory(NULL, 0xA000) == 0xBB);
+
+    free(romData); romData = NULL;
+    printf("OK\n");
+}
+
 void test_vram_to_rgb_logic() {
     printf("Testing VRAM to RGB Logic (Screen 2)... ");
     UInt8 vram[0x4000];
@@ -170,6 +205,7 @@ void test_vram_to_rgb_logic() {
 int main() {
     test_mapper_konami();
     test_mapper_ascii8();
+    test_mapper_mirrored();
     test_vram_to_rgb_logic();
     printf("Verification logic SUCCESS\n");
     return 0;

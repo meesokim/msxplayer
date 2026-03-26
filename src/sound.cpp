@@ -42,6 +42,11 @@ void initSound() {
     }
 }
 
+extern "C" void clearQueuedAudio(void) {
+    if (audioDevice != 0)
+        SDL_ClearQueuedAudio(audioDevice);
+}
+
 extern "C" void updateSound() {
     if (audioDevice == 0) return;
 

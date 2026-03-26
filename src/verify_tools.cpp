@@ -18,7 +18,10 @@ static bool readFileAll(const std::string& path, std::vector<UInt8>& out) {
     fseek(f, 0, SEEK_SET);
     if (sz < 0) { fclose(f); return false; }
     out.resize((size_t)sz);
-    if (sz > 0) fread(out.data(), 1, (size_t)sz, f);
+    if (sz > 0) {
+        size_t nr = fread(out.data(), 1, (size_t)sz, f);
+        (void)nr; /* truncated read still yields partial DB row; caller checks size */
+    }
     fclose(f);
     return true;
 }
@@ -49,7 +52,9 @@ static MapperType openMsxTypeToMapper(const std::string& t) {
     if (t == "Konami") return MAPPER_KONAMI;
     if (t == "KonamiSCC") return MAPPER_KONAMI_SCC;
     if (t == "ASCII8") return MAPPER_ASCII8;
+    if (t == "ASCII8SRAM2" || t == "ASCII8SRAM8") return MAPPER_ASCII8_SRAM2;
     if (t == "ASCII16" || t == "ASCII16SRAM8" || t == "ASCII16SRAM2") return MAPPER_ASCII16;
+    if (t == "PAGE2" || t == "page2") return MAPPER_PAGE2;
     return MAPPER_NONE;
 }
 
@@ -81,7 +86,7 @@ static int buildMapperDb(const std::string& romRoot, const std::string& openMsxX
     listFilesRec(romRoot, files);
     FILE* out = fopen(outDb.c_str(), "w");
     if (!out) return 1;
-    fprintf(out, "# sha1,mapper\n");
+    fprintf(out, "# sha1,mapper,basic,font  (basic 0/1, font e/j/k; verify_tools uses 0,e)\n");
     int total = 0, matched = 0;
     for (const std::string& p : files) {
         if (!(endsWithLower(p, ".rom") || endsWithLower(p, ".mx1") || endsWithLower(p, ".bin"))) continue;
@@ -94,7 +99,7 @@ static int buildMapperDb(const std::string& romRoot, const std::string& openMsxX
             mapper = it->second;
             matched++;
         }
-        fprintf(out, "%s,%s\n", sha1.c_str(), mapperTypeName(mapper));
+        fprintf(out, "%s,%s,0,e\n", sha1.c_str(), mapperTypeName(mapper));
         total++;
     }
     fclose(out);

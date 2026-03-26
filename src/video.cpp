@@ -174,7 +174,7 @@ static void drawText(int x, int y, const char* txt, UInt16 fg, UInt16 bg, int w)
     }
 }
 
-extern "C" void DrawMenu(const std::vector<std::string>& files, int selected, int offset) {
+extern "C" void DrawMenu(const std::vector<std::string>& files, int selected, int offset, int biosMode, int fontEjk) {
     if (!window) return;
     memset(frameBuffer, 0, sizeof(frameBuffer));
 
@@ -188,7 +188,8 @@ extern "C" void DrawMenu(const std::vector<std::string>& files, int selected, in
     sprintf(pageBuf, "%d/%d", curPage, totalPages);
     drawText(220, 4, pageBuf, 0xFFE0, 0, 8); // Yellow page counter
 
-    for (int i = 0; i < pageSize && (offset + i) < files.size(); i++) {
+    const int nfiles = (int)files.size();
+    for (int i = 0; i < pageSize && offset + i < nfiles; i++) {
         int idx = offset + i;
         bool isSel = (idx == selected);
         UInt16 fg = isSel ? 0x0000 : 0xFFFF;
@@ -209,6 +210,21 @@ extern "C" void DrawMenu(const std::vector<std::string>& files, int selected, in
         drawText(8, 16 + i * 8, buf, fg, bg, 6);
     }
 
+    {
+        char foot1[52];
+        {
+            const char* bl = "emb";
+            if (biosMode == 1) bl = "C-BIOS+basic";
+            else if (biosMode == 2) bl = "VG8020";
+            else if (biosMode == 3) bl = "main+logo";
+            snprintf(foot1, sizeof(foot1), "B=BIOS:%s", bl);
+        }
+        drawText(8, 208, foot1, 0xFFE0, 0, 6);
+        const char* act = (fontEjk == 1) ? "J" : ((fontEjk == 2) ? "K" : "E");
+        char foot2[52];
+        snprintf(foot2, sizeof(foot2), "E/J/K font (one): %s", act);
+        drawText(8, 216, foot2, 0xAD55, 0, 6);
+    }
 
     int winW, winH; SDL_GetWindowSize(window, &winW, &winH);
     glViewport(0, 0, winW, winH);
