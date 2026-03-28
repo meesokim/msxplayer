@@ -46,9 +46,15 @@ enum MapperType {
     MAPPER_ASCII8,
     MAPPER_ASCII8_SRAM2,
     MAPPER_ASCII16,
+    /** openMSX RomMSXWrite: ASCII16 + bank writes at 6FFFh and 7FFFh. */
+    MAPPER_MSXWRITE,
+    /** openMSX RomAscii16_2 (ASCII16SRAM2): 2 KiB SRAM, select with bank value 0x10. */
+    MAPPER_ASCII16_SRAM2,
     MAPPER_MIRRORED,
     /** openMSX RomType PAGE2: ROM only at 8000h–BFFFh (16 KiB window). */
-    MAPPER_PAGE2
+    MAPPER_PAGE2,
+    /** openMSX RomRType: Irem R-Type; 4000h–7FFFh fixed bank 0x17; 8000h–BFFFh via writes 4000h–7FFFh. */
+    MAPPER_RTYPE
 };
 extern MapperType romMapper;
 extern int romBanks[4];
@@ -64,5 +70,8 @@ void writeMemory(void* ref, UInt16 address, UInt8 value);
 extern "C" UInt8 readIoPort(void* ref, UInt16 address);
 extern "C" void  writeIoPort(void* ref, UInt16 address, UInt8 value);
 extern "C" void* ioPortGetRef(int port);
+
+/** ROM list menu: lines per page (keep in sync with DrawMenu in video.cpp). */
+#define MSXPLAY_MENU_PAGE_SIZE 20
 
 #endif

@@ -53,7 +53,11 @@ static MapperType openMsxTypeToMapper(const std::string& t) {
     if (t == "KonamiSCC") return MAPPER_KONAMI_SCC;
     if (t == "ASCII8") return MAPPER_ASCII8;
     if (t == "ASCII8SRAM2" || t == "ASCII8SRAM8") return MAPPER_ASCII8_SRAM2;
-    if (t == "ASCII16" || t == "ASCII16SRAM8" || t == "ASCII16SRAM2") return MAPPER_ASCII16;
+    if (t == "ASCII16") return MAPPER_ASCII16;
+    if (t == "MSXWrite") return MAPPER_MSXWRITE;
+    if (t == "ASCII16SRAM2") return MAPPER_ASCII16_SRAM2;
+    if (t == "R-Type") return MAPPER_RTYPE;
+    if (t == "ASCII16SRAM8") return MAPPER_ASCII16; /* TODO: 8 KiB SRAM variant (A-Train) */
     if (t == "PAGE2" || t == "page2") return MAPPER_PAGE2;
     return MAPPER_NONE;
 }

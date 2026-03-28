@@ -8,7 +8,7 @@ typedef unsigned char UInt8;
 typedef unsigned short UInt16;
 typedef unsigned int UInt32;
 
-enum MapperType { MAPPER_NONE, MAPPER_KONAMI, MAPPER_KONAMI_SCC, MAPPER_ASCII8, MAPPER_ASCII8_SRAM2, MAPPER_ASCII16, MAPPER_MIRRORED, MAPPER_PAGE2 };
+enum MapperType { MAPPER_NONE, MAPPER_KONAMI, MAPPER_KONAMI_SCC, MAPPER_ASCII8, MAPPER_ASCII8_SRAM2, MAPPER_ASCII16, MAPPER_MSXWRITE, MAPPER_ASCII16_SRAM2, MAPPER_MIRRORED, MAPPER_PAGE2, MAPPER_RTYPE };
 
 // Mocking required state
 UInt8 ram[0x10000];
@@ -157,45 +157,41 @@ void test_vram_to_rgb_logic() {
     UInt16 palette[16];
     UInt8 regs[16];
     memset(vram, 0, 0x4000);
-    for(int i=0; i<16; i++) palette[i] = i;
+    for (int i = 0; i < 16; i++) palette[i] = i;
 
-    regs[2] = 0x06; // NT at 0x1800
-    regs[4] = 0x03; // PG at 0x0000
-    regs[3] = 0xFF; // CT at 0x2000
-    
-    vram[0x0000] = 0x80; // Pattern 10000000
-    vram[0x2000] = 0xF1; // FG=15, BG=1
-    vram[0x1800] = 0x00; // Char 0
+    regs[2] = 0x06;
+    regs[4] = 0x03;
+    regs[3] = 0x80; /* color table base — separates pat vs col fetch for y=128, tile 0 */
 
-    // Manual extraction based on Screen 2 logic in video.cpp
-    int nt = (regs[2] << 10) & 0x3FFF;
-    int pb = (regs[4] & 0x3C) << 11;
-    int pm = ((regs[4] & 0x03) << 11) | 0x7FF;
-    int cb = (regs[3] & 0x80) << 6;
-    int cm = ((regs[3] & 0x7F) << 6) | 0x3F;
+    const int y = 128;
+    vram[0x1800 + (y / 8) * 32] = 0x00;
+    vram[0x1000] = 0x80;
+    vram[0x2000] = 0xF1;
 
-    int y = 0;
-    int zone = (y / 64) << 11;
-    int py = y % 8;
-    int row = (y / 8) * 32;
-    int tx = 0;
-    
-    int idx = zone | (vram[(nt + row + tx) & 0x3FFF] << 3) | py;
-    UInt8 pat = vram[(pb | (idx & pm)) & 0x3FFF];
-    UInt8 col = vram[(cb | (idx & cm)) & 0x3FFF];
-    
+    const int chrTabBase = (((int)regs[2] << 10) | 0x3FF) & 0x3FFF;
+    const int chrGenBase = (((int)regs[4] << 11) | 0x7FF) & 0x3FFF;
+    const int colTabBase = (((int)regs[3] << 6) | 0x3F) & 0x3FFF;
+
+    const int row = (y / 8) * 32;
+    const unsigned baseU = 0xFFFFE000u | ((unsigned)(y & 0xC0) << 5) | (unsigned)(y & 7);
+    const int ntAddr = (chrTabBase & (int)(0xFFFFFC00u | (unsigned)row)) & 0x3FFF;
+    const UInt8 code = vram[ntAddr];
+    const int idx = (int)(baseU | ((unsigned)code << 3));
+    const UInt8 pat = vram[(chrGenBase & idx) & 0x3FFF];
+    const UInt8 col = vram[(colTabBase & idx) & 0x3FFF];
+
     assert(pat == 0x80);
     assert(col == 0xF1);
-    
+
     UInt16 pfg = palette[col >> 4];
     UInt16 pbg = palette[col & 0x0F];
-    
+
     assert(pfg == 15);
     assert(pbg == 1);
-    
+
     UInt16 pixel0 = (pat & 0x80) ? pfg : pbg;
     UInt16 pixel1 = (pat & 0x40) ? pfg : pbg;
-    
+
     assert(pixel0 == 15);
     assert(pixel1 == 1);
 

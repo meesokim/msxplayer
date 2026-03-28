@@ -15,11 +15,6 @@ void biosLoaderInit(void) {
     s_inited = true;
 }
 
-static const char* mainRomForFont(char font) {
-    if (font == 'j' || font == 'J') return "cbios_main_msx1_jp.rom";
-    return "cbios_main_msx1.rom";
-}
-
 static bool tryLoadFile(UInt8* dest, size_t destSize, const char* filename, const std::vector<std::string>& dirs) {
     for (size_t i = 0; i < dirs.size(); ++i) {
         std::string path = dirs[i];
@@ -47,14 +42,31 @@ static bool tryLoadFirstOf(UInt8* dest, size_t destSize, const char* const* name
     return false;
 }
 
-bool biosLoaderApply(unsigned biosMode, char font, const std::vector<std::string>& searchDirs) {
+static bool applyCbiosMainAndSecondary(const char* mainRom, const char* const* secondaryList,
+                                       const std::vector<std::string>& searchDirs, unsigned biosModeForMsg) {
+    if (!tryLoadFile(bios, sizeof(bios), mainRom, searchDirs)) {
+        printf("biosLoader: FAILED to load main '%s'", mainRom);
+        if (biosModeForMsg == 1 || biosModeForMsg == 5)
+            printf(" — using embedded BIOS\n");
+        fflush(stdout);
+        memcpy(bios, s_biosBackup, sizeof(bios));
+        memcpy(bios_logo, s_logoBackup, sizeof(bios_logo));
+        return biosModeForMsg != 1 && biosModeForMsg != 5;
+    }
+
+    if (!tryLoadFirstOf(bios_logo, sizeof(bios_logo), secondaryList, searchDirs)) {
+        printf("biosLoader: no secondary ROM (tried logo/basic) — using embedded 8000h region\n");
+        fflush(stdout);
+        memcpy(bios_logo, s_logoBackup, sizeof(bios_logo));
+    }
+    return true;
+}
+
+bool biosLoaderApply(unsigned biosMode, const std::vector<std::string>& searchDirs) {
     if (!s_inited) biosLoaderInit();
 
-    const bool jpOrKr = (font == 'j' || font == 'J' || font == 'k' || font == 'K');
     unsigned mode = biosMode;
-    if (mode > 3) mode = 0;
-    if (mode == 0 && jpOrKr)
-        mode = 1;
+    if (mode > 5) mode = 0;
 
     if (mode == 0) {
         memcpy(bios, s_biosBackup, sizeof(bios));
@@ -74,10 +86,32 @@ bool biosLoaderApply(unsigned biosMode, char font, const std::vector<std::string
         return true;
     }
 
+    if (mode == 4) {
+        if (!tryLoadFile(bios, sizeof(bios), "hb-10_basic-bios1.rom", searchDirs)) {
+            printf("biosLoader: hb-10_basic-bios1.rom missing — embedded\n");
+            fflush(stdout);
+            memcpy(bios, s_biosBackup, sizeof(bios));
+            memcpy(bios_logo, s_logoBackup, sizeof(bios_logo));
+            return false;
+        }
+        memcpy(bios_logo, s_logoBackup, sizeof(bios_logo));
+        return true;
+    }
+
+    static const char* const secondaryJp[] = {
+        "cbios_logo_msx1.rom",
+        "cbios_basic.rom",
+        nullptr
+    };
+    static const char* const secondaryEu[] = {
+        "cbios_basic.rom",
+        "cbios_logo_msx1.rom",
+        nullptr
+    };
+
     if (mode == 3) {
-        const char* mainName = mainRomForFont(font);
-        if (!tryLoadFile(bios, sizeof(bios), mainName, searchDirs)) {
-            printf("biosLoader: FAILED to load main '%s' (main+logo mode) — embedded\n", mainName);
+        if (!tryLoadFile(bios, sizeof(bios), "cbios_main_msx1.rom", searchDirs)) {
+            printf("biosLoader: FAILED to load main 'cbios_main_msx1.rom' (main+logo mode) — embedded\n");
             fflush(stdout);
             memcpy(bios, s_biosBackup, sizeof(bios));
             memcpy(bios_logo, s_logoBackup, sizeof(bios_logo));
@@ -92,38 +126,9 @@ bool biosLoaderApply(unsigned biosMode, char font, const std::vector<std::string
         return true;
     }
 
-    /* mode == 1: C-BIOS main + basic/logo */
-    const char* mainName = mainRomForFont(font);
-    if (!tryLoadFile(bios, sizeof(bios), mainName, searchDirs)) {
-        printf("biosLoader: FAILED to load main '%s'", mainName);
-        if (biosMode == 1)
-            printf(" — using embedded BIOS\n");
-        else
-            printf(" — J/K needs this file; using embedded BIOS\n");
-        fflush(stdout);
-        memcpy(bios, s_biosBackup, sizeof(bios));
-        memcpy(bios_logo, s_logoBackup, sizeof(bios_logo));
-        return biosMode != 1;
-    }
+    if (mode == 5)
+        return applyCbiosMainAndSecondary("cbios_main_msx1_jp.rom", secondaryJp, searchDirs, 5);
 
-    static const char* const secondaryJp[] = {
-        "cbios_logo_msx1.rom",
-        "cbios_basic.rom",
-        nullptr
-    };
-    static const char* const secondaryEu[] = {
-        "cbios_basic.rom",
-        "cbios_logo_msx1.rom",
-        nullptr
-    };
-    const bool japanese = (font == 'j' || font == 'J');
-    const char* const* secondaryList = japanese ? secondaryJp : secondaryEu;
-
-    if (!tryLoadFirstOf(bios_logo, sizeof(bios_logo), secondaryList, searchDirs)) {
-        printf("biosLoader: no secondary ROM (tried logo/basic) — using embedded 8000h region\n");
-        fflush(stdout);
-        memcpy(bios_logo, s_logoBackup, sizeof(bios_logo));
-    }
-
-    return true;
+    /* mode == 1 */
+    return applyCbiosMainAndSecondary("cbios_main_msx1.rom", secondaryEu, searchDirs, 1);
 }

@@ -4,84 +4,90 @@ A lightweight, standalone MSX1/2 emulator core integrated with SDL2, featuring h
 
 ## Features
 
-- **Hardware-Accurate Rendering**: 
-  - Manual high-performance implementation of TMS9918A Screen Modes 0, 1, and 2.
-  - Precise bitmasking for pattern and color tables.
-  - Full support for 16x16 and 32x32 (magnified) sprites with Early Clock (EC) bit clipping.
-- **MegaROM Support**: 
-  - Integrated ROM bank-switching for MegaROMs.
-  - Support for **Konami** and **ASCII 8K** mappers, enabling play of larger titles like *Vampire Killer*, *Metal Gear*, and *Nemesis* series.
+- **Hardware-Accurate Rendering**:
+  - TMS9918A Screen Modes 0, 1, 2, and 3 (multicolor).
+  - **Screen 2 (Graphics II)**: Pattern/color fetches match blueberryMSX / VDP behavior (`chrGenBase & index`, `colTabBase & index`). The index must not be pre-masked with VRAM size before the AND with table bases (fixes bottom-third and wide-area glitches vs. split `cb`/`cm` shortcuts).
+  - Full support for 16×16 and 32×32 (magnified) sprites with Early Clock (EC) bit clipping.
+- **MegaROM / Mapper Support**:
+  - **Konami**, **Konami SCC**, **ASCII8**, **ASCII16**, **ASCII16 SRAM**, **MSX-DOS 2 / MSX-WRITE**, **PAGE2** (8 KiB ROM at `8000h`), **mirrored** small ROMs, and **R-Type (Irem)**-style **RTYPE** mapper (openMSX `RomRType`: 16 KiB banks, fixed `4000h–7FFFh` page, switchable `8000h–BFFFh`).
+  - **Mapper database** (`mapper_db.csv`): SHA-1–based profiles (mapper type, BIOS mode, font). Includes entries for **R-Type** and **Scion** (Mirrored) among others.
+  - **Ctrl+F5**: Cycle mapper mode when a ROM is not in the database (includes `RTYPE`, megaROM order, etc.).
 - **Enhanced User Experience**:
-  - **Game Selection Menu**: Built-in interactive ROM browser with keyboard navigation.
-  - **CBIOS Integration**: Automatically uses CBIOS for legal, out-of-the-box MSX1 emulation.
-  - **Last Game Persistence**: Remembers the last game played for quick resumption.
-  - **Fullscreen Toggle**: Press `Alt + Enter` to switch between windowed and fullscreen modes.
-  - **Scanline Effect**: CRT-style scanline overlay for an authentic retro feel (Toggle with `F8`).
-- **Standalone Executable**: BIOS ROMs are now embedded directly into the executable, removing the need for external `cbios_*.rom` files and making the emulator truly portable.
+  - **Game Selection Menu**: ROM browser with keyboard navigation.
+  - **CBIOS Integration**: Optional C-BIOS and other BIOS modes via loader.
+  - **Last Game Persistence**: `last_game.txt`.
+  - **Fullscreen**: `Alt+Enter`.
+  - **Scanlines**: `F8`.
+- **Standalone / BIOS**: Embedded BIOS paths and loader improvements for portable builds.
 - **Enhanced ROM Compatibility**:
-  - Improved mapper detection logic to correctly handle standard 32KB ROMs (e.g., *Yokai Yashiki*).
-  - Added support for 16KB ROM mirroring to fix graphical issues in games like *Dig Dug*.
-  - Added support for header-less 16KB ROMs that start at address `0x0000` (e.g., *Zenji*).
-- **Robust Input System**:
-  - Comprehensive mapping of the full MSX keyboard matrix.
-  - Integrated PSG Port A joystick emulation mapped to Arrow keys and Space/Z/X.
-- **Performance Optimizations**:
-  - **HLE VDP Hooks**: High-Level Emulation for VRAM block transfers (`LDIRVM`), significantly boosting rendering speed for supported games.
-- **Audio Support**:
-  - Integrated PSG (AY-8910) audio mixer with SDL2 output.
-- **Diagnostic Tools**:
-  - **VRAM Capture**: Press `Print Screen` to dump VRAM to `capture.sc2` and take a screenshot to `capture.bmp`.
-  - **VRAM Viewer**: Real-time tile/pattern visualization via the `-v` command-line option.
-  - **Debug Mode**: Detailed VDP and I/O logging via the `-d` option.
+  - Mirrored `<64 KiB` ROM handling aligned with openMSX `RomPlain` heuristics (`g_mirroredFirstPage`).
+  - Plain 16/32 KiB and header-based detection.
+- **Input**: MSX keyboard matrix; PSG joystick mapped to arrows and Space/Z/X.
+- **Performance**: HLE hooks for VRAM block transfers (`LDIRVM`) where applicable.
+- **Audio**: AY-8910 (PSG), SCC when used by mapper.
+- **Diagnostics**:
+  - **Print Screen**: VRAM dump / screenshot.
+  - **VRAM Viewer**: `-v`.
+  - **Debug**: `-d`.
+  - **verify_core** / **verify_tools**: Mapper and VRAM unit checks (`make verify`, `make verify-tools`).
 - **Portability**:
-  - **ZIP Support**: Directly load ROM files from ZIP archives.
-  - **Fully Static Build**: Single executable with no external DLL dependencies for Windows.
+  - ZIP loading.
+  - **Linux** and **Windows** builds (MinGW cross-compile; see Makefile).
+
+## blueberryMSX (upstream-style build)
+
+The tree may include a **`blueberryMSX`** symlink to a full [blueberryMSX](https://github.com/pokebyte/blueberryMSX) checkout used for VDP/CPU reference. The Makefile there supports:
+
+- **`make`** or **`make OS=linux`** — native Linux (`bluemsx`), SDL2 + libudev + OpenGL.
+- **`make OS=mingw`** — Windows PE cross-compile (`bluemsx.exe`), MinGW-w64 + SDL2 MinGW dev tree; **`MINGW_SDL2`** should point at the `x86_64-w64-mingw32` folder from the official SDL2 MinGW development archive.
+- **`make help`** — prints usage only (default goal is **`all`**, not `help`).
+- Linux-only **`PiUdev.c`** is replaced by **`Src/Pi/PiUdevStub.c`** on MinGW builds.
+
 ## Build Instructions
 
 ### Requirements
+
 - GCC/G++ (Linux)
-- MinGW-w64 (for Windows cross-compilation)
-- SDL2 Development Libraries
+- MinGW-w64 (Windows cross-compilation)
+- SDL2 development libraries (`libsdl2-dev` on Debian/Ubuntu)
+- Optional: `pkg-config` for SDL2 flags
 
 ### Building
+
 ```bash
-# Build both Linux and Windows versions
+# Linux + Windows binaries (see Makefile for msxplay.exe / MinGW deps)
 make all
 
-# Build and run core verification tests (Mapper & VRAM)
+# Mapper / VRAM verification
 make verify
+make verify-tools
 
-# Build only Linux version
+# Linux only
 make msxplay
-```
 
-# Build only Windows version
+# Windows cross (requires deps/local_win or equivalent SDL2 MinGW layout)
 make msxplay.exe
 ```
 
 ## Usage
 
 ```bash
-# Run a game
 ./msxplay "Game.rom"
-
-# Run a game from a ZIP archive
 ./msxplay "Game.zip"
-
-# Enable VRAM Viewer
 ./msxplay -v "Game.rom"
-
-# Enable Debug Logging
 ./msxplay -d "Game.rom"
 ```
 
 ### Controls
-- **Arrow Keys**: Directional movement
-- **SPACE / Z**: Button A (Select / Fire)
-- **X**: Button B
-- **1 / 2**: Start game (1-player / 2-player)
-- **Print Screen**: Capture VRAM and Screenshot
-- **ESC**: Exit
+
+- **Arrows** — movement  
+- **SPACE / Z** — button A  
+- **X** — button B  
+- **1 / 2** — start (1P / 2P)  
+- **Print Screen** — capture  
+- **Ctrl+F5** — cycle mapper (if ROM not in DB)  
+- **ESC** — quit  
 
 ## Project Architecture
-This project leverages the core emulation logic from `blueMSX` (R800 CPU, VDP, and PSG cores) and provides a specialized SDL2-based platform layer for video, audio, and input handling.
+
+Core emulation (R800, VDP, PSG, etc.) is derived from **blueMSX**-family sources; this project adds the SDL2 platform layer, menu, mapper database, and focused video/IO glue.

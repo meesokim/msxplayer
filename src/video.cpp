@@ -1,11 +1,14 @@
 #include "msxplay.h"
 #include "FrameBuffer.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <vector>
 #include <string>
+#include <algorithm>
 #define GL_GLEXT_PROTOTYPES
 #include <SDL2/SDL_opengl.h>
+#include <SDL2/SDL_ttf.h>
 
 // GL function pointers
 typedef GLuint (APIENTRY *PFNGLCREATESHADERPROC) (GLenum type);
@@ -44,6 +47,10 @@ static SDL_Window* window = NULL;
 static SDL_GLContext glContext = NULL;
 static GLuint shaderProgram = 0;
 static GLuint textureId = 0;
+/** Full viewport resolution; ROM menu draws natively here (no 272×240 upscale). */
+static GLuint menuTextureId = 0;
+static int menuTextureAllocW = 0;
+static int menuTextureAllocH = 0;
 static GLuint vbo = 0;
 static GLint u_scanline_loc = -1;
 
@@ -53,16 +60,31 @@ static const char* vertexShaderSource =
     "attribute vec2 a_pos; attribute vec2 a_tex; varying vec2 v_tex;"
     "void main() { gl_Position = vec4(a_pos, 0.0, 1.0); v_tex = a_tex; }";
 
-static const char* fragmentShaderSource = 
-    "precision mediump float; varying vec2 v_tex; uniform sampler2D u_tex; uniform float u_scanline;"
-    "void main() {"
-    "    vec4 col = texture2D(u_tex, v_tex);"
-    "    if (u_scanline > 0.5) {"
-    "        float s = sin(v_tex.y * 240.0 * 3.141592) * 0.12 + 0.88;"
-    "        col.rgb *= s;"
-    "    }"
-    "    gl_FragColor = col;"
-    "}";
+/* CRT-style: per-emulated-line mask (240 lines), soft falloff, slight vertical bleed, vignette */
+static const char* fragmentShaderSource = R"GLSL(
+precision mediump float;
+varying vec2 v_tex;
+uniform sampler2D u_tex;
+uniform float u_scanline;
+void main() {
+    vec4 col = texture2D(u_tex, v_tex);
+    if (u_scanline > 0.5) {
+        float ph = fract(v_tex.y * 240.0);
+        float beam = smoothstep(0.0, 0.19, ph) * smoothstep(1.0, 0.73, ph);
+        float shade = mix(0.71, 1.0, beam);
+        vec3 lit = col.rgb * shade;
+        vec2 belowUV = clamp(v_tex + vec2(0.0, 0.55 / 240.0), vec2(0.0), vec2(1.0));
+        vec3 tail = texture2D(u_tex, belowUV).rgb;
+        float bleed = (1.0 - beam) * 0.14;
+        col.rgb = mix(lit, tail * 0.93, bleed);
+        vec2 c = (v_tex - 0.5) * 1.12;
+        float vig = 0.88 + 0.12 * smoothstep(1.05, 0.2, dot(c, c));
+        col.rgb *= vig;
+        col.rgb = clamp(col.rgb, 0.0, 1.0);
+    }
+    gl_FragColor = col;
+}
+)GLSL";
 
 static GLuint compileShader(GLenum type, const char* source) {
     GLuint shader = _glCreateShader(type);
@@ -155,82 +177,331 @@ static void renderMSX1Screen3(UInt8* vram, UInt8* regs, UInt16* palette, int vra
     }
 }
 
-// Basic font renderer using BIOS font
-static void drawChar(int x, int y, char c, UInt16 fg, UInt16 bg, int w) {
-    if (x < 0 || x > 272-w || y < 0 || y > 232) return;
-    const UInt8* font = bios + 0x1BBF; // Standard MSX BIOS font location
-    for (int i = 0; i < 8; i++) {
-        UInt8 pat = font[(UInt8)c * 8 + i];
-        for (int b = 0; b < w; b++) {
-            frameBuffer[(y + i) * 272 + (x + b)] = (pat & (0x80 >> (b * 8 / w))) ? fg : bg;
+/* ROM menu palette (RGB565) */
+static const UInt16 kMenuBg = 0x0841;
+static const UInt16 kMenuTitle = 0xFEC0;
+static const UInt16 kMenuTitShadow = 0x18C3;
+static const UInt16 kMenuRowFg = 0xDEDB;
+static const UInt16 kMenuSelBg = 0x2D7F;
+static const UInt16 kMenuSelTop = 0x4E9F;
+static const UInt16 kMenuSelFg = 0xFFFF;
+static const UInt16 kMenuFootHi = 0xFEC0;
+static const UInt16 kMenuFootLo = 0x8C72;
+
+static UInt16 menuBlend565(UInt16 fg, UInt16 bg, unsigned wFg256) {
+    unsigned ar = (fg >> 11) & 0x1Fu, ag = (fg >> 5) & 0x3Fu, ab = fg & 0x1Fu;
+    unsigned br = (bg >> 11) & 0x1Fu, bbg = (bg >> 5) & 0x3Fu, bb = bg & 0x1Fu;
+    unsigned dr = (ar * wFg256 + br * (256u - wFg256)) >> 8;
+    unsigned dg = (ag * wFg256 + bbg * (256u - wFg256)) >> 8;
+    unsigned db = (ab * wFg256 + bb * (256u - wFg256)) >> 8;
+    if (dr > 31) dr = 31;
+    if (dg > 63) dg = 63;
+    if (db > 31) db = 31;
+    return (UInt16)((dr << 11) | (dg << 5) | db);
+}
+
+static TTF_Font* g_menuTitleFont = nullptr;
+static int g_menuTitleFontPx = 0;
+
+static void menu565ToRgb888(UInt16 c, Uint8* r, Uint8* g, Uint8* b) {
+    unsigned rr = (unsigned)(c >> 11) & 31u, gg = (unsigned)(c >> 5) & 63u, bb = (unsigned)c & 31u;
+    *r = (Uint8)((rr * 255u + 15u) / 31u);
+    *g = (Uint8)((gg * 255u + 31u) / 63u);
+    *b = (Uint8)((bb * 255u + 15u) / 31u);
+}
+
+static UInt16 menuRgb888To565(Uint8 r, Uint8 g, Uint8 b) {
+    unsigned rr = ((unsigned)r * 31u + 127u) / 255u;
+    unsigned gg = ((unsigned)g * 63u + 127u) / 255u;
+    unsigned bb = ((unsigned)b * 31u + 127u) / 255u;
+    if (rr > 31u) rr = 31u;
+    if (gg > 63u) gg = 63u;
+    if (bb > 31u) bb = 31u;
+    return (UInt16)((rr << 11) | (gg << 5) | bb);
+}
+
+static void menuBlitArgbSurfaceTo565(UInt16* fb, int fbW, int fbH, int dx, int dy, SDL_Surface* surf) {
+    if (!surf) return;
+    SDL_Surface* conv = nullptr;
+    SDL_Surface* s = surf;
+    if (surf->format->format != SDL_PIXELFORMAT_ARGB8888) {
+        conv = SDL_ConvertSurfaceFormat(surf, SDL_PIXELFORMAT_ARGB8888, 0);
+        if (!conv) return;
+        s = conv;
+    }
+    if (SDL_MUSTLOCK(s)) SDL_LockSurface(s);
+    int w = s->w, h = s->h;
+    for (int y = 0; y < h; y++) {
+        const Uint32* row = (const Uint32*)((const Uint8*)s->pixels + y * s->pitch);
+        for (int x = 0; x < w; x++) {
+            Uint32 p = row[x];
+            Uint8 r, g, b, a;
+            SDL_GetRGBA(p, s->format, &r, &g, &b, &a);
+            int px = dx + x, py = dy + y;
+            if (px < 0 || py < 0 || px >= fbW || py >= fbH) continue;
+            UInt16* d = &fb[py * fbW + px];
+            if (a == 0) continue;
+            UInt16 fg = menuRgb888To565(r, g, b);
+            if (a == 255) *d = fg;
+            else *d = menuBlend565(fg, *d, (unsigned)a * 256u / 255u);
+        }
+    }
+    if (SDL_MUSTLOCK(s)) SDL_UnlockSurface(s);
+    if (conv) SDL_FreeSurface(conv);
+}
+
+static bool menuEnsureTitleFont(int px) {
+    if (px < 8) px = 8;
+    if (g_menuTitleFont && g_menuTitleFontPx == px) return true;
+    if (g_menuTitleFont) {
+        TTF_CloseFont(g_menuTitleFont);
+        g_menuTitleFont = nullptr;
+        g_menuTitleFontPx = 0;
+    }
+    static std::string baseFont;
+    char* base = SDL_GetBasePath();
+    if (base) {
+        baseFont = std::string(base) + "fonts/MenuTitle.ttf";
+        SDL_free(base);
+        g_menuTitleFont = TTF_OpenFont(baseFont.c_str(), px);
+        if (g_menuTitleFont) {
+            g_menuTitleFontPx = px;
+            return true;
+        }
+    }
+    static const char* kTryUnix[] = {
+        "fonts/MenuTitle.ttf",
+        "./fonts/MenuTitle.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSans-Bold.ttf",
+        nullptr
+    };
+    static const char* kWinRel[] = { "/Fonts/arialbd.ttf", "/Fonts/segoeuib.ttf", "/Fonts/calibrib.ttf", nullptr };
+    const char* windir = getenv("SYSTEMROOT");
+    if (!windir) windir = getenv("WINDIR");
+    if (windir) {
+        static std::string winFont;
+        for (int i = 0; kWinRel[i]; i++) {
+            winFont = std::string(windir) + kWinRel[i];
+            g_menuTitleFont = TTF_OpenFont(winFont.c_str(), px);
+            if (g_menuTitleFont) {
+                g_menuTitleFontPx = px;
+                return true;
+            }
+        }
+    }
+    for (int i = 0; kTryUnix[i]; i++) {
+        g_menuTitleFont = TTF_OpenFont(kTryUnix[i], px);
+        if (g_menuTitleFont) {
+            g_menuTitleFontPx = px;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool menuDrawTitleTtf(UInt16* fb, int fbW, int fbH, int marginX, int marginY, int titlePx, const char* text) {
+    if (!menuEnsureTitleFont(titlePx)) return false;
+    Uint8 sr, sg, sb, mr, mg, mb;
+    menu565ToRgb888(kMenuTitShadow, &sr, &sg, &sb);
+    menu565ToRgb888(kMenuTitle, &mr, &mg, &mb);
+    SDL_Color shadow = { sr, sg, sb, 255 };
+    SDL_Color mainc = { mr, mg, mb, 255 };
+    SDL_Surface* sh = TTF_RenderUTF8_Blended(g_menuTitleFont, text, shadow);
+    SDL_Surface* ma = TTF_RenderUTF8_Blended(g_menuTitleFont, text, mainc);
+    if (!ma) {
+        if (sh) SDL_FreeSurface(sh);
+        return false;
+    }
+    int off = std::max(1, titlePx / 14);
+    if (sh) {
+        menuBlitArgbSurfaceTo565(fb, fbW, fbH, marginX + off, marginY + off, sh);
+        SDL_FreeSurface(sh);
+    }
+    menuBlitArgbSurfaceTo565(fb, fbW, fbH, marginX, marginY, ma);
+    SDL_FreeSurface(ma);
+    return true;
+}
+
+/** Scale MSX 8×8 font to cw×ch with nearest-neighbor (integer only — was 8× supersampled floats per pixel). */
+static void menuDrawGlyph(UInt16* fb, int fbW, int fbH, int x, int y, unsigned char uc, UInt16 fg, UInt16 bg, int cw,
+    int glyphH, const UInt8* ft) {
+    if (uc < 32) uc = (unsigned char)' ';
+    const UInt8* gbase = ft + (unsigned)uc * 8u;
+    if (cw < 1 || glyphH < 1) return;
+    for (int i = 0; i < glyphH; i++) {
+        int py = y + i;
+        if (py < 0 || py >= fbH) continue;
+        int fontRow = (i * 8) / glyphH;
+        if (fontRow > 7) fontRow = 7;
+        UInt8 pat = gbase[fontRow];
+        int rowOff = py * fbW;
+        for (int b = 0; b < cw; b++) {
+            int px = x + b;
+            if (px < 0 || px >= fbW) continue;
+            int fontCol = (b * 8) / cw;
+            if (fontCol > 7) fontCol = 7;
+            fb[rowOff + px] = (pat & (UInt8)(0x80u >> (unsigned)fontCol)) ? fg : bg;
         }
     }
 }
 
-static void drawText(int x, int y, const char* txt, UInt16 fg, UInt16 bg, int w) {
+static void menuDrawText(UInt16* fb, int fbW, int fbH, int x, int y, const char* txt, UInt16 fg, UInt16 bg, int cw,
+    int glyphH, const UInt8* ft) {
     while (*txt) {
-        drawChar(x, y, *txt++, fg, bg, w);
-        x += w;
+        unsigned char uc = (unsigned char)*txt++;
+        menuDrawGlyph(fb, fbW, fbH, x, y, uc, fg, bg, cw, glyphH, ft);
+        x += cw;
     }
 }
 
-extern "C" void DrawMenu(const std::vector<std::string>& files, int selected, int offset, int biosMode, int fontEjk) {
+/* 4:3 TV aspect: 256×192 active picture on a 4:3 CRT has ~4:3 dot centering; stretch vs square 272×240 buffer. */
+static const float kMsxDisplayAspectRatio = 4.0f / 3.0f;
+
+/** Letterbox to 4:3; 272×240 texture is scaled into this viewport (menu uses same helper). */
+static void menuComputeLetterboxViewport(int winW, int winH, int* vpX, int* vpY, int* vpW, int* vpH) {
+    float targetAspect = kMsxDisplayAspectRatio;
+    int vw = winW, vh = winH, vx = 0, vy = 0;
+    if (winH > 0 && (float)winW / (float)winH > targetAspect) {
+        vw = (int)((float)winH * targetAspect);
+        vx = (winW - vw) / 2;
+    } else if (winW > 0) {
+        vh = (int)((float)winW / targetAspect);
+        vy = (winH - vh) / 2;
+    }
+    if (vw < 1) vw = 1;
+    if (vh < 1) vh = 1;
+    *vpX = vx;
+    *vpY = vy;
+    *vpW = vw;
+    *vpH = vh;
+}
+
+extern "C" void DrawMenu(const std::vector<std::string>& files, int selected, int offset, int biosMode) {
     if (!window) return;
-    memset(frameBuffer, 0, sizeof(frameBuffer));
+    int winW, winH;
+    SDL_GetWindowSize(window, &winW, &winH);
+    int vpX, vpY, vpW, vpH;
+    menuComputeLetterboxViewport(winW, winH, &vpX, &vpY, &vpW, &vpH);
 
-    drawText(8, 4, "[MSXPLAYER ROM SELECT]", 0xFFFF, 0, 8);
+    static std::vector<UInt16> menuFb;
+    const size_t need = (size_t)vpW * (size_t)vpH;
+    if (menuFb.size() != need) menuFb.resize(need);
+    UInt16* fb = menuFb.data();
+    std::fill(fb, fb + need, kMenuBg);
 
-    // Page counter
-    int pageSize = 24;
-    int totalPages = (files.size() + pageSize - 1) / pageSize;
+    const UInt8* ft = bios + 0x1BBF;
+    const int pageSize = MSXPLAY_MENU_PAGE_SIZE;
+
+    const int marginX = std::max(4, vpW / 48);
+    const int marginY = std::max(2, vpH / 80);
+
+    int titleCh = std::max(10, std::min(vpH / 11, vpH / 5));
+    int titleCw = titleCh;
+
+    int footCh = std::max(8, std::min(vpH / 24, titleCh));
+    int footCw = std::max(5, (footCh * 7 + 9) / 10);
+    const int footGap = std::max(2, marginY / 2);
+    const int yFoot1 = vpH - marginY - 2 * footCh - footGap;
+    const int yFoot2 = yFoot1 + footCh + footGap;
+
+    int yList = marginY + titleCh + marginY;
+    int listBudget = yFoot1 - marginY - yList;
+    if (listBudget < pageSize * 6) {
+        titleCh = std::max(10, titleCh - 6);
+        titleCw = titleCh;
+        yList = marginY + titleCh + marginY;
+        listBudget = yFoot1 - marginY - yList;
+    }
+    int lineH = listBudget / pageSize;
+    lineH = std::max(4, std::min(lineH, vpH / 4));
+    if (yList + pageSize * lineH > yFoot1 - marginY)
+        lineH = std::max(3, (yFoot1 - marginY - yList) / pageSize);
+    int listCw = std::max(4, (lineH * 7 + 9) / 10);
+    int listCh = lineH;
+
+    const char* title = "[MSXPLAYER ROM SELECT]";
+    if (!menuDrawTitleTtf(fb, vpW, vpH, marginX, marginY, titleCh, title)) {
+        const int shadow = std::max(1, titleCh / 12);
+        menuDrawText(fb, vpW, vpH, marginX + shadow, marginY + shadow, title, kMenuTitShadow, kMenuBg, titleCw, titleCh, ft);
+        menuDrawText(fb, vpW, vpH, marginX, marginY, title, kMenuTitle, kMenuBg, titleCw, titleCh, ft);
+    }
+
+    int totalPages = (int)((files.size() + (size_t)pageSize - 1) / (size_t)pageSize);
+    if (totalPages < 1) totalPages = 1;
     int curPage = (offset / pageSize) + 1;
-    char pageBuf[16];
-    sprintf(pageBuf, "%d/%d", curPage, totalPages);
-    drawText(220, 4, pageBuf, 0xFFE0, 0, 8); // Yellow page counter
+    char pageBuf[24];
+    snprintf(pageBuf, sizeof(pageBuf), "%d/%d", curPage, totalPages);
+    int pageStrW = (int)strlen(pageBuf) * footCw;
+    int pyPage = marginY + std::max(0, (titleCh - footCh) / 2);
+    menuDrawText(fb, vpW, vpH, vpW - marginX - pageStrW, pyPage, pageBuf, kMenuFootHi, kMenuBg, footCw, footCh, ft);
 
     const int nfiles = (int)files.size();
+    int maxFilenameChars = (vpW - 2 * marginX - 8) / listCw;
+    maxFilenameChars = std::max(8, std::min(maxFilenameChars, 80));
+
     for (int i = 0; i < pageSize && offset + i < nfiles; i++) {
         int idx = offset + i;
         bool isSel = (idx == selected);
-        UInt16 fg = isSel ? 0x0000 : 0xFFFF;
-        UInt16 bg = isSel ? 0xF800 : 0x0000;
+        int rowY = yList + i * lineH;
+        UInt16 fg = isSel ? kMenuSelFg : kMenuRowFg;
+        UInt16 lineBg = isSel ? kMenuSelBg : kMenuBg;
 
-        char buf[41];
-        strncpy(buf, files[idx].c_str(), 40); buf[40] = 0;
-
-        if (isSel) {
-            for (int ry = 0; ry < 8; ry++) {
-                for (int rx = 0; rx < 272; rx++) {
-                    frameBuffer[(16 + i * 8 + ry) * 272 + rx] = bg;
-                }
+        for (int ry = 0; ry < lineH; ry++) {
+            UInt16 bar = lineBg;
+            if (isSel) {
+                if (ry == 0) bar = menuBlend565(kMenuSelTop, kMenuSelBg, 200);
+                else if (ry == 1) bar = menuBlend565(kMenuSelTop, kMenuSelBg, 55);
             }
+            int pyy = rowY + ry;
+            if (pyy < 0 || pyy >= vpH) continue;
+            for (int rx = 0; rx < vpW; rx++) fb[pyy * vpW + rx] = bar;
         }
 
-        // drawText(8, 16 + i * 8, (idx == selected) ? ">" : " ", fg, bg, 6);
-        drawText(8, 16 + i * 8, buf, fg, bg, 6);
+        char buf[96];
+        strncpy(buf, files[idx].c_str(), sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = 0;
+        if ((int)strlen(buf) > maxFilenameChars) buf[maxFilenameChars] = 0;
+
+        int textY = rowY + (lineH - listCh) / 2;
+        if (textY < rowY) textY = rowY;
+        menuDrawText(fb, vpW, vpH, marginX + 4, textY, buf, fg, lineBg, listCw, listCh, ft);
     }
 
     {
         char foot1[52];
         {
             const char* bl = "emb";
-            if (biosMode == 1) bl = "C-BIOS+basic";
+            if (biosMode == 1) bl = "C-BIOS";
             else if (biosMode == 2) bl = "VG8020";
             else if (biosMode == 3) bl = "main+logo";
-            snprintf(foot1, sizeof(foot1), "B=BIOS:%s", bl);
+            else if (biosMode == 4) bl = "HB-10";
+            else if (biosMode == 5) bl = "C-BIOS JP";
+            snprintf(foot1, sizeof(foot1), "B: next BIOS  now:%s", bl);
         }
-        drawText(8, 208, foot1, 0xFFE0, 0, 6);
-        const char* act = (fontEjk == 1) ? "J" : ((fontEjk == 2) ? "K" : "E");
-        char foot2[52];
-        snprintf(foot2, sizeof(foot2), "E/J/K font (one): %s", act);
-        drawText(8, 216, foot2, 0xAD55, 0, 6);
+        menuDrawText(fb, vpW, vpH, marginX, yFoot1, foot1, kMenuFootHi, kMenuBg, footCw, footCh, ft);
+        menuDrawText(fb, vpW, vpH, marginX, yFoot2, "Enter=start  Esc=quit", kMenuFootLo, kMenuBg, footCw, footCh, ft);
     }
 
-    int winW, winH; SDL_GetWindowSize(window, &winW, &winH);
-    glViewport(0, 0, winW, winH);
+    if (menuTextureId == 0) {
+        glGenTextures(1, &menuTextureId);
+        glBindTexture(GL_TEXTURE_2D, menuTextureId);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    }
+    if (menuTextureAllocW != vpW || menuTextureAllocH != vpH) {
+        glBindTexture(GL_TEXTURE_2D, menuTextureId);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, vpW, vpH, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, NULL);
+        menuTextureAllocW = vpW;
+        menuTextureAllocH = vpH;
+    }
+    glViewport(vpX, vpY, vpW, vpH);
     glClear(GL_COLOR_BUFFER_BIT);
-    glBindTexture(GL_TEXTURE_2D, textureId);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 272, 240, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, frameBuffer);
+    glBindTexture(GL_TEXTURE_2D, menuTextureId);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vpW, vpH, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, fb);
     _glUseProgram(shaderProgram);
     _glUniform1f(u_scanline_loc, 0.0f);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -291,14 +562,21 @@ extern "C" void RefreshScreen(int screenMode) {
             }
         } else if (mode == 3) { // Screen 3 multicolor (e.g. Bifamu)
             renderMSX1Screen3(vram, regs, palette, vramMask);
-        } else { // Screen 2
-            int nt = (regs[2] << 10) & 0x3C00, pb = (regs[4] & 0x3C) << 11, pm = ((regs[4] & 0x03) << 11) | 0x7FF;
-            int cb = (regs[3] & 0x80) << 6, cm = ((regs[3] & 0x7F) << 6) | 0x3F;
+        } else { // Screen 2 (Graphics II) — blueberryMSX RefreshLine2: index unmasked; only final addr & vramMask
+            const int chrTabBase = (((int)regs[2] << 10) | 0x3FF) & vramMask;
+            const int chrGenBase = (((int)regs[4] << 11) | 0x7FF) & vramMask;
+            const int colTabBase = (((int)regs[3] << 6) | 0x3F) & vramMask;
             for (int y = 0; y < 192; y++) {
-                int zone = (y / 64) << 11, py = y % 8, row = (y / 8) * 32, dstOff = (y + 24) * 272 + 8;
+                const int row = (y / 8) * 32;
+                /* Avoid (-1<<13) on signed (UB); same bits as blueberry base */
+                const unsigned baseU = 0xFFFFE000u | ((unsigned)(y & 0xC0) << 5) | (unsigned)(y & 7);
+                int dstOff = (y + 24) * 272 + 8;
                 for (int tx = 0; tx < 32; tx++) {
-                    int idx = zone | (vram[(nt + row + tx) & vramMask] << 3) | py;
-                    UInt8 pat = vram[(pb | (idx & pm)) & vramMask], col = vram[(cb | (idx & cm)) & vramMask];
+                    const int ntAddr = (chrTabBase & (int)(0xFFFFFC00u | (unsigned)(row + tx))) & vramMask;
+                    const UInt8 code = vram[ntAddr];
+                    const int idx = (int)(baseU | ((unsigned)code << 3));
+                    const UInt8 pat = vram[(chrGenBase & idx) & vramMask];
+                    const UInt8 col = vram[(colTabBase & idx) & vramMask];
                     UInt16 pfg = palette[col >> 4], pbg = palette[col & 0x0F];
                     for (int b = 0; b < 8; b++) frameBuffer[dstOff + tx*8 + b] = (pat & (0x80 >> b)) ? pfg : pbg;
                 }
@@ -338,11 +616,10 @@ extern "C" void RefreshScreen(int screenMode) {
         }
     }
 
-    int winW, winH; SDL_GetWindowSize(window, &winW, &winH);
-    float targetAspect = 272.0f / 240.0f;
-    int vpW = winW, vpH = winH, vpX = 0, vpY = 0;
-    if ((float)winW / winH > targetAspect) { vpW = (int)(winH * targetAspect); vpX = (winW - vpW) / 2; }
-    else { vpH = (int)(winW / targetAspect); vpY = (winH - vpH) / 2; }
+    int winW, winH;
+    SDL_GetWindowSize(window, &winW, &winH);
+    int vpX, vpY, vpW, vpH;
+    menuComputeLetterboxViewport(winW, winH, &vpX, &vpY, &vpW, &vpH);
 
     glViewport(vpX, vpY, vpW, vpH);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -364,9 +641,12 @@ extern "C" void saveScreenshot(const char* filename) {
 #define LOAD_GL(name, type) _##name = (type)SDL_GL_GetProcAddress(#name);
 
 void initVideo() {
-    window = SDL_CreateWindow("msxplay", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 272*2, 240*2, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL);
+    window = SDL_CreateWindow("msxplay", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        (int)(240 * 2 * kMsxDisplayAspectRatio), 240 * 2, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL);
     glContext = SDL_GL_CreateContext(window);
     SDL_GL_SetSwapInterval(0);
+    if (TTF_Init() == -1)
+        fprintf(stderr, "msxplay: TTF_Init failed: %s\n", TTF_GetError());
 
     LOAD_GL(glCreateShader, PFNGLCREATESHADERPROC);
     LOAD_GL(glShaderSource, PFNGLSHADERSOURCEPROC);

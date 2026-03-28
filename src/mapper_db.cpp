@@ -35,10 +35,10 @@ static char parseFontField(const std::string& s) {
     return 'e';
 }
 
-/** CSV column "basic": legacy 0/1 or digit 0-3 (bios bundle). */
+/** CSV column "basic": legacy 0/1 or digit 0-5 (bios bundle; 5 = C-BIOS JP). */
 static unsigned char parseBiosModeField(const std::string& s) {
     std::string t = trim(s);
-    if (t.size() == 1 && t[0] >= '0' && t[0] <= '3') return (unsigned char)(t[0] - '0');
+    if (t.size() == 1 && t[0] >= '0' && t[0] <= '5') return (unsigned char)(t[0] - '0');
     return parseBoolField(s) ? (unsigned char)1 : (unsigned char)0;
 }
 
@@ -50,8 +50,11 @@ const char* mapperTypeName(MapperType mapper) {
         case MAPPER_ASCII8: return "ASCII8";
         case MAPPER_ASCII8_SRAM2: return "ASCII8SRAM2";
         case MAPPER_ASCII16: return "ASCII16";
+        case MAPPER_MSXWRITE: return "MSXWrite";
+        case MAPPER_ASCII16_SRAM2: return "ASCII16SRAM2";
         case MAPPER_MIRRORED: return "MIRRORED";
         case MAPPER_PAGE2: return "PAGE2";
+        case MAPPER_RTYPE: return "RTYPE";
         default: return "NONE";
     }
 }
@@ -63,8 +66,11 @@ MapperType mapperTypeFromName(const std::string& nameIn) {
     if (name == "ASCII8") return MAPPER_ASCII8;
     if (name == "ASCII8SRAM2") return MAPPER_ASCII8_SRAM2;
     if (name == "ASCII16") return MAPPER_ASCII16;
+    if (name == "MSXWrite") return MAPPER_MSXWRITE;
+    if (name == "ASCII16SRAM2") return MAPPER_ASCII16_SRAM2;
     if (name == "MIRRORED") return MAPPER_MIRRORED;
     if (name == "PAGE2") return MAPPER_PAGE2;
+    if (name == "RTYPE") return MAPPER_RTYPE;
     return MAPPER_NONE;
 }
 
@@ -116,7 +122,7 @@ bool MapperDb::findProfile(const std::string& sha1, RomDbProfile& out) const {
 }
 
 static std::string profileLine(const std::string& sha1, const RomDbProfile& p) {
-    char bm = (char)('0' + (p.biosMode > 3 ? 0 : p.biosMode));
+    char bm = (char)('0' + (p.biosMode > 5 ? 0 : p.biosMode));
     return sha1 + "," + std::string(mapperTypeName(p.mapper)) + "," + std::string(1, bm) + "," + std::string(1, p.font) + "\n";
 }
 
@@ -150,7 +156,7 @@ bool MapperDb::upsertProfile(const std::string& path, const std::string& sha1, c
     }
     if (!replaced) {
         if (!hadHeader && lines.empty())
-            lines.push_back("# sha1,mapper,bios,font  bios: 0=emb 1=C-BIOS+basic 2=VG8020 3=main+logo  font: e/j/k\n");
+            lines.push_back("# sha1,mapper,bios,font  bios: 0=emb 1=C-BIOS 2=VG8020 3=main+logo 4=HB-10 5=C-BIOS JP  font: legacy (use bios 5 for JP)\n");
         lines.push_back(profileLine(sha1, profile));
     }
     FILE* fout = fopen(path.c_str(), "w");

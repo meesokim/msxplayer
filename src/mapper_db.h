@@ -7,7 +7,7 @@
 
 struct RomDbProfile {
     MapperType mapper = MAPPER_NONE;
-    /** 0=embedded 1=C-BIOS main+cbios_basic/logo 2=vg8020_basic-bios1.rom 3=cbios_main+cbios_logo only */
+    /** 0=emb 1=C-BIOS intl 2=VG8020 3=main+logo 4=HB-10 5=C-BIOS JP (cbios_main_msx1_jp.rom) */
     unsigned char biosMode = 0;
     char font = 'e'; /* e=international, j=Japanese, k=Korean */
 };
