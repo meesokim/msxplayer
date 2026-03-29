@@ -1,11 +1,23 @@
 #include "msxplay.h"
 #include "FrameBuffer.h"
+#include "hash_util.h"
+#include "game_issue_tags.h"
+#include "mapper_db.h"
+#include "msx_dir_index.h"
+#include "png_rgb.h"
+#include "msx1_render_frame.h"
+#include "vram_snapshot.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+extern "C" {
+int vdp_msxplay_coherent_frame_grab = 0;
+}
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <unordered_map>
 #define GL_GLEXT_PROTOTYPES
 #include <SDL2/SDL_opengl.h>
 #include <SDL2/SDL_ttf.h>
@@ -103,79 +115,9 @@ extern "C" UInt8* vdpGetRegsPtr();
 extern UInt8 bios[0x8000];
 
 static UInt16 frameBuffer[272 * 240];
-
-/* Register mix key: same as blueberryMSX updateScreenMode() first switch (MSX1). */
-static int msx1RegMixKey(UInt8* regs) {
-    return ((regs[0] & 0x0e) >> 1) | (regs[1] & 0x18);
-}
-
-/*
- * SCREEN 0 + 2 (mix key 0x11): VDP reports screenMode 0 but hardware uses
- * RefreshLine0Plus — text layout (40 cols / 256px) + Graphics II pattern fetch.
- * Drawing pure SCREEN 0 here causes wrong VRAM layout and vertical stripe artifacts.
- * Ported from blueberryMSX Common.h RefreshLine0Plus (hScroll=0).
- */
-static void renderMSX1Screen0Plus(UInt8* vram, UInt8* regs, UInt16 pfg, UInt16 pbg, int vramMask) {
-    const int chrTabBase = (((int)regs[2] << 10) | 0x3FF) & vramMask;
-    const int chrGenBase = (((int)regs[4] << 11) | 0x7FF) & vramMask;
-    const int ntOrMask = (int)(0xFFFFF000u); /* (-1<<12) */
-
-    for (int y = 0; y < 192; y++) {
-        const unsigned yu = (unsigned)y;
-        const int patternBase = (int)(0xFFFFE000u | ((yu & 0xC0u) << 5) | (yu & 7u));
-        int shift = 0;
-        int xChar = 0;
-        int patternByte = 0;
-        int dstOff = (y + 24) * 272 + 8;
-
-        for (int tileX = 0; tileX < 32; tileX++) {
-            if (tileX == 0 || tileX == 31) {
-                for (int p = 0; p < 8; p++)
-                    frameBuffer[dstOff++] = pbg;
-            } else {
-                for (int j = 0; j < 4; j++) {
-                    if (shift <= 2) {
-                        int charIdx = 0xC00 + 40 * (y / 8) + xChar++;
-                        int ntAddr = (chrTabBase & (ntOrMask | charIdx)) & vramMask;
-                        UInt8 code = vram[ntAddr];
-                        int pAddr = (chrGenBase & (patternBase | (code * 8))) & vramMask;
-                        patternByte = vram[pAddr];
-                        shift = 8;
-                    }
-                    int bit = (patternByte >> (--shift)) & 1;
-                    frameBuffer[dstOff++] = bit ? pfg : pbg;
-                    bit = (patternByte >> (--shift)) & 1;
-                    frameBuffer[dstOff++] = bit ? pfg : pbg;
-                }
-            }
-        }
-    }
-}
-
-/*
- * SCREEN 3 (multicolor): vdp screenMode == 3. Was incorrectly drawn with the Screen 2 path
- * (wrong VRAM layout → black or garbage). Ported from blueberryMSX Common.h RefreshLine3 (no sprites in cell).
- */
-static void renderMSX1Screen3(UInt8* vram, UInt8* regs, UInt16* palette, int vramMask) {
-    const int chrTabBase = (((int)regs[2] << 10) | 0x3FF) & vramMask;
-    const int chrGenBase = (((int)regs[4] << 11) | 0x7FF) & vramMask;
-    const int ntRowMask = (int)(0xFFFFFC00u);   /* (-1<<10) */
-    const int patLineMask = (int)(0xFFFFF800u); /* (-1<<11) */
-
-    for (int y = 0; y < 192; y++) {
-        const int ntRow = (chrTabBase & (ntRowMask | (32 * (y / 8)))) & vramMask;
-        const int patternBase = (chrGenBase & (patLineMask | ((y >> 2) & 7))) & vramMask;
-        int dstOff = (y + 24) * 272 + 8;
-        for (int tx = 0; tx < 32; tx++) {
-            const UInt8 code = vram[(ntRow + tx) & vramMask];
-            const UInt8 colPat = vram[(patternBase | (code * 8)) & vramMask];
-            const UInt16 fc = palette[colPat >> 4];
-            const UInt16 bc = palette[colPat & 0x0F];
-            for (int p = 0; p < 4; p++) frameBuffer[dstOff++] = fc;
-            for (int p = 0; p < 4; p++) frameBuffer[dstOff++] = bc;
-        }
-    }
-}
+static UInt8 snapVram[0x4000];
+static UInt8 snapRegs[64];
+static UInt16 snapPal[16];
 
 /* ROM menu palette (RGB565) */
 static const UInt16 kMenuBg = 0x0841;
@@ -380,7 +322,11 @@ static void menuComputeLetterboxViewport(int winW, int winH, int* vpX, int* vpY,
     *vpH = vh;
 }
 
-extern "C" void DrawMenu(const std::vector<std::string>& files, int selected, int offset, int biosMode) {
+static std::unordered_map<std::string, std::string> g_menuRomPathToSha1;
+
+extern "C" void DrawMenu(const std::vector<std::string>* plainFiles, const std::vector<MsxDirGameEntry>* indexedEntries,
+                       int selected, int offset, int biosMode, const GameIssueTags* issueTags, const std::string* menuBaseDir,
+                       const MapperDb* mapperDb) {
     if (!window) return;
     int winW, winH;
     SDL_GetWindowSize(window, &winW, &winH);
@@ -430,7 +376,9 @@ extern "C" void DrawMenu(const std::vector<std::string>& files, int selected, in
         menuDrawText(fb, vpW, vpH, marginX, marginY, title, kMenuTitle, kMenuBg, titleCw, titleCh, ft);
     }
 
-    int totalPages = (int)((files.size() + (size_t)pageSize - 1) / (size_t)pageSize);
+    const int nfilesTotal =
+        indexedEntries ? (int)indexedEntries->size() : (plainFiles ? (int)plainFiles->size() : 0);
+    int totalPages = (int)(((size_t)nfilesTotal + (size_t)pageSize - 1) / (size_t)pageSize);
     if (totalPages < 1) totalPages = 1;
     int curPage = (offset / pageSize) + 1;
     char pageBuf[24];
@@ -439,7 +387,7 @@ extern "C" void DrawMenu(const std::vector<std::string>& files, int selected, in
     int pyPage = marginY + std::max(0, (titleCh - footCh) / 2);
     menuDrawText(fb, vpW, vpH, vpW - marginX - pageStrW, pyPage, pageBuf, kMenuFootHi, kMenuBg, footCw, footCh, ft);
 
-    const int nfiles = (int)files.size();
+    const int nfiles = nfilesTotal;
     int maxFilenameChars = (vpW - 2 * marginX - 8) / listCw;
     maxFilenameChars = std::max(8, std::min(maxFilenameChars, 80));
 
@@ -461,14 +409,84 @@ extern "C" void DrawMenu(const std::vector<std::string>& files, int selected, in
             for (int rx = 0; rx < vpW; rx++) fb[pyy * vpW + rx] = bar;
         }
 
+        std::string full;
+        std::string sh;
+        const char* displayName = "";
+        bool indexedRow = indexedEntries && idx < (int)indexedEntries->size();
+        if (indexedRow) {
+            const MsxDirGameEntry& ge = (*indexedEntries)[idx];
+            displayName = ge.filename.c_str();
+            sh = ge.sha1;
+            if (menuBaseDir)
+                full = *menuBaseDir + "/" + ge.filename;
+        } else if (plainFiles && idx < (int)plainFiles->size()) {
+            displayName = (*plainFiles)[idx].c_str();
+            if (menuBaseDir)
+                full = *menuBaseDir + "/" + (*plainFiles)[idx];
+            if (!full.empty()) {
+                auto it = g_menuRomPathToSha1.find(full);
+                if (it != g_menuRomPathToSha1.end())
+                    sh = it->second;
+                else {
+                    sh = sha1HexFile(full.c_str());
+                    if (!sh.empty()) g_menuRomPathToSha1[full] = sh;
+                }
+            }
+        }
+
+        const char* tagPref = "";
+        if (indexedRow) {
+            const MsxDirGameEntry& ge = (*indexedEntries)[idx];
+            if (!ge.loadOk)
+                tagPref = "[X] ";
+            else if (ge.issue || (issueTags && !sh.empty() && issueTags->contains(sh)))
+                tagPref = "[!] ";
+        } else if (issueTags && menuBaseDir && !issueTags->empty() && !sh.empty() && issueTags->contains(sh))
+            tagPref = "[!] ";
+        const int tagCh = (int)strlen(tagPref);
+
+        char metaBuf[96] = "";
+        bool haveDbMeta = false;
+        if (indexedRow) {
+            const MsxDirGameEntry& ge = (*indexedEntries)[idx];
+            const char* lang = (ge.prof.font == 'j' || ge.prof.font == 'k') ? "JP" : "EN";
+            if (!ge.loadOk)
+                snprintf(metaBuf, sizeof(metaBuf), "%s|%s|%s|ERR", mapperTypeName(ge.mapper),
+                    ge.prof.msxBasic ? "BAS" : "noB", lang);
+            else
+                snprintf(metaBuf, sizeof(metaBuf), "%s|%s|%s|%s", mapperTypeName(ge.mapper),
+                    ge.prof.msxBasic ? "BAS" : "noB", lang, romDbBiosShortLabel(ge.prof));
+            haveDbMeta = true;
+        } else if (mapperDb && !sh.empty()) {
+            RomDbProfile prof;
+            if (mapperDb->findProfile(sh, prof)) {
+                romDbFormatMenuMeta(prof, metaBuf, sizeof(metaBuf));
+                haveDbMeta = true;
+            }
+        }
+
+        int metaLen = haveDbMeta ? (int)strlen(metaBuf) : 0;
+        int nameBudget = maxFilenameChars - tagCh;
+        if (haveDbMeta && metaLen > 0)
+            nameBudget = std::max(4, maxFilenameChars - tagCh - metaLen - 1);
+
         char buf[96];
-        strncpy(buf, files[idx].c_str(), sizeof(buf) - 1);
+        strncpy(buf, displayName, sizeof(buf) - 1);
         buf[sizeof(buf) - 1] = 0;
-        if ((int)strlen(buf) > maxFilenameChars) buf[maxFilenameChars] = 0;
+        if ((int)strlen(buf) > nameBudget) buf[nameBudget] = 0;
+
+        char lineBuf[112];
+        snprintf(lineBuf, sizeof(lineBuf), "%s%s", tagPref, buf);
 
         int textY = rowY + (lineH - listCh) / 2;
         if (textY < rowY) textY = rowY;
-        menuDrawText(fb, vpW, vpH, marginX + 4, textY, buf, fg, lineBg, listCw, listCh, ft);
+        const int rowTextX = marginX + 4;
+        menuDrawText(fb, vpW, vpH, rowTextX, textY, lineBuf, fg, lineBg, listCw, listCh, ft);
+        if (haveDbMeta && metaLen > 0) {
+            int metaX = rowTextX + (maxFilenameChars - metaLen) * listCw;
+            if (metaX >= rowTextX)
+                menuDrawText(fb, vpW, vpH, metaX, textY, metaBuf, kMenuFootLo, lineBg, listCw, listCh, ft);
+        }
     }
 
     {
@@ -483,7 +501,7 @@ extern "C" void DrawMenu(const std::vector<std::string>& files, int selected, in
             snprintf(foot1, sizeof(foot1), "B: next BIOS  now:%s", bl);
         }
         menuDrawText(fb, vpW, vpH, marginX, yFoot1, foot1, kMenuFootHi, kMenuBg, footCw, footCh, ft);
-        menuDrawText(fb, vpW, vpH, marginX, yFoot2, "Enter=start  Esc=quit", kMenuFootLo, kMenuBg, footCw, footCh, ft);
+        menuDrawText(fb, vpW, vpH, marginX, yFoot2, "E=mark  U=unmark  Enter=start  Alt+F4=quit", kMenuFootLo, kMenuBg, footCw, footCh, ft);
     }
 
     if (menuTextureId == 0) {
@@ -508,113 +526,43 @@ extern "C" void DrawMenu(const std::vector<std::string>& files, int selected, in
     SDL_GL_SwapWindow(window);
 }
 
+/**
+ * Host video refresh. Normally invoked from blueberry onDisplay() at emulated vblank
+ * (same boundary as original blueberryMSX / similar to openMSX frameStart+paint cadence).
+ * screenMode < 0 forces a full paint (startup, diagnostics), bypassing 30fps decimation.
+ */
 extern "C" void RefreshScreen(int screenMode) {
     if (!window) return;
+
+    const int forcePaint = (screenMode < 0);
+
+    /* ~30fps host update: skip every other vblank-driven call (emulation stays ~60Hz). */
+    static unsigned s_vblankPresentSeq;
+    if (!forcePaint) {
+        s_vblankPresentSeq++;
+        if (s_vblankPresentSeq >= 2u && (s_vblankPresentSeq & 1u) == 0u)
+            return;
+    }
+
     UInt8* vram = vdpGetVramPtr();
     UInt16* palette = vdpGetPalettePtr();
     UInt8* regs = vdpGetRegsPtr();
     if (!vram || !palette || !regs) return;
 
-    int bgCol = regs[7] & 0x0F;
-    UInt16 bgPixel = palette[bgCol];
+    /* onDisplay already sync'd to frame end; keep one sync so stray callers stay coherent. */
+    vdpForceSync();
+
+    /* drawArea is 0 at vblank (onDrawAreaEnd / onDisplay); vram snap + skipping sync in VDP I/O
+     * during grab matches openMSX-style “no re-entrant line render while sampling VRAM”. */
+
+    vdp_msxplay_coherent_frame_grab = 1;
+    memcpy(snapVram, vram, sizeof(snapVram));
+    memcpy(snapRegs, regs, sizeof(snapRegs));
+    memcpy(snapPal, palette, sizeof(snapPal));
     int displayEnabled = vdpGetScreenOn();
     int mode = vdpGetScreenMode();
-    int vramMask = 0x3FFF;
-
-    for (int i = 0; i < 272 * 240; i++) frameBuffer[i] = bgPixel;
-
-    if (displayEnabled) {
-        const int mixKey = msx1RegMixKey(regs);
-        int fg = regs[7] >> 4, bg = regs[7] & 0x0F;
-        UInt16 pfg = palette[fg], pbg = palette[bg];
-
-        if (mode == 0 && mixKey == 0x11) {
-            /* SCREEN 0 + Graphics II (e.g. Alpha Roid title) */
-            renderMSX1Screen0Plus(vram, regs, pfg, pbg, vramMask);
-        } else if (mode == 0) { // Screen 0 only (mixKey 0x10)
-            int nt = (regs[2] << 10) & vramMask, pb = (regs[4] << 11) & vramMask;
-            for (int y = 0; y < 192; y++) {
-                int py = y % 8, row = (y / 8) * 40, dstOff = (y + 24) * 272 + 16;
-                for (int tx = 0; tx < 40; tx++) {
-                    UInt8 pat = vram[(pb + vram[(nt + row + tx) & vramMask] * 8 + py) & vramMask];
-                    for (int b = 0; b < 6; b++) frameBuffer[dstOff + tx*6 + b] = (pat & (0x80 >> b)) ? pfg : pbg;
-                }
-            }
-        } else if (mode == 1) { // Screen 1
-            int nt = (regs[2] << 10) & vramMask;
-            int pb = (regs[4] << 11) & vramMask;
-            int ct = (regs[3] << 6) & vramMask;
-            for (int y = 0; y < 192; y++) {
-                int ty = y / 8;
-                int py = y % 8;
-                int rowStart = ty * 32;
-                int dstOff = (y + 24) * 272 + 8;
-                for (int tx = 0; tx < 32; tx++) {
-                    int code = vram[(nt + rowStart + tx) & vramMask];
-                    UInt8 pat = vram[(pb + code * 8 + py) & vramMask];
-                    UInt8 col = vram[(ct + code / 8) & vramMask];
-                    pfg = palette[col >> 4];
-                    pbg = palette[col & 0x0F];
-                    for (int b = 0; b < 8; b++) {
-                        frameBuffer[dstOff + tx * 8 + b] = (pat & (0x80 >> b)) ? pfg : pbg;
-                    }
-                }
-            }
-        } else if (mode == 3) { // Screen 3 multicolor (e.g. Bifamu)
-            renderMSX1Screen3(vram, regs, palette, vramMask);
-        } else { // Screen 2 (Graphics II) — blueberryMSX RefreshLine2: index unmasked; only final addr & vramMask
-            const int chrTabBase = (((int)regs[2] << 10) | 0x3FF) & vramMask;
-            const int chrGenBase = (((int)regs[4] << 11) | 0x7FF) & vramMask;
-            const int colTabBase = (((int)regs[3] << 6) | 0x3F) & vramMask;
-            for (int y = 0; y < 192; y++) {
-                const int row = (y / 8) * 32;
-                /* Avoid (-1<<13) on signed (UB); same bits as blueberry base */
-                const unsigned baseU = 0xFFFFE000u | ((unsigned)(y & 0xC0) << 5) | (unsigned)(y & 7);
-                int dstOff = (y + 24) * 272 + 8;
-                for (int tx = 0; tx < 32; tx++) {
-                    const int ntAddr = (chrTabBase & (int)(0xFFFFFC00u | (unsigned)(row + tx))) & vramMask;
-                    const UInt8 code = vram[ntAddr];
-                    const int idx = (int)(baseU | ((unsigned)code << 3));
-                    const UInt8 pat = vram[(chrGenBase & idx) & vramMask];
-                    const UInt8 col = vram[(colTabBase & idx) & vramMask];
-                    UInt16 pfg = palette[col >> 4], pbg = palette[col & 0x0F];
-                    for (int b = 0; b < 8; b++) frameBuffer[dstOff + tx*8 + b] = (pat & (0x80 >> b)) ? pfg : pbg;
-                }
-            }
-        }
-        // Optimized Sprites
-        int large = regs[1] & 0x02, mag = regs[1] & 0x01;
-        int spriteTab = ((int)regs[5] << 7) & vramMask, spriteGen = ((int)regs[6] << 11) & vramMask;
-        int size = mag ? (large ? 32 : 16) : (large ? 16 : 8);
-
-        int numSprites = 32;
-        for (int i = 0; i < 32; i++) {
-            if (vram[spriteTab + i * 4] == 208) {
-                numSprites = i;
-                break;
-            }
-        }
-
-        for (int i = numSprites - 1; i >= 0; i--) {
-            int sy_raw = vram[spriteTab + i * 4];
-            int sc_raw = vram[spriteTab + i * 4 + 3]; int sc = sc_raw & 0x0F; if (!sc) continue;
-            int sx = vram[spriteTab + i * 4 + 1]; if (sc_raw & 0x80) sx -= 32;
-            int si = vram[spriteTab + i * 4 + 2]; if (large) si &= ~0x03;
-            int sy = (sy_raw > 208) ? sy_raw - 255 : sy_raw + 1;
-            UInt16 psc = palette[sc];
-            for (int py = 0; py < size; py++) {
-                int vY = sy + py; if (vY < 0 || vY >= 192) continue;
-                int rowOff = (vY + 24) * 272, vPy = mag ? (py / 2) : py;
-                for (int px = 0; px < size; px++) {
-                    int vX = sx + px; if (vX < 0 || vX >= 256) continue;
-                    int vPx = mag ? (px / 2) : px;
-                    int tOff = large ? ((vPx / 8) * 2 + (vPy / 8)) : 0;
-                    if ((vram[(spriteGen + (si + tOff) * 8 + (vPy % 8)) & 0x3FFF] >> (7 - (vPx % 8))) & 1) 
-                        frameBuffer[rowOff + (vX + 8)] = psc;
-                }
-            }
-        }
-    }
+    msx1RenderFrameToRgb565(snapVram, snapRegs, snapPal, displayEnabled, mode, frameBuffer);
+    vdp_msxplay_coherent_frame_grab = 0;
 
     int winW, winH;
     SDL_GetWindowSize(window, &winW, &winH);
@@ -636,6 +584,30 @@ extern "C" void saveScreenshot(const char* filename) {
     glReadPixels(0, 0, 272, 240, GL_RGBA, GL_UNSIGNED_BYTE, s->pixels);
     SDL_SaveBMP(s, filename);
     SDL_FreeSurface(s);
+}
+
+/** VRAM + VDP regs + palette for vramviewer / offline replay (paired with issue PNG). */
+extern "C" int saveEmulationVramSnapshot(const char* filename) {
+    if (!filename) return 0;
+    vdpForceSync();
+    UInt8* vram = vdpGetVramPtr();
+    UInt16* palette = vdpGetPalettePtr();
+    UInt8* regs = vdpGetRegsPtr();
+    if (!vram || !palette || !regs) return 0;
+    return vramSnapshotWriteFile(filename, vram, regs, palette, vdpGetScreenOn(), vdpGetScreenMode());
+}
+
+/** Last emulated frame (272×240 RGB565) → PNG. Call after RefreshScreen so buffer matches display. */
+extern "C" int saveEmulationFramebufferPng(const char* filename) {
+    if (!filename) return 0;
+    static unsigned char rgb[272 * 240 * 3];
+    for (int i = 0; i < 272 * 240; i++) {
+        UInt16 p = frameBuffer[i];
+        rgb[i * 3 + 0] = (unsigned char)(((p >> 11) & 31) * 255 / 31);
+        rgb[i * 3 + 1] = (unsigned char)(((p >> 5) & 63) * 255 / 63);
+        rgb[i * 3 + 2] = (unsigned char)((p & 31) * 255 / 31);
+    }
+    return writePngRgb24(filename, 272, 240, rgb, 272 * 3);
 }
 
 #define LOAD_GL(name, type) _##name = (type)SDL_GL_GetProcAddress(#name);

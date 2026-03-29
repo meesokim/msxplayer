@@ -2,6 +2,8 @@
 #include <SDL2/SDL_gamecontroller.h>
 #include "hash_util.h"
 #include "mapper_db.h"
+#include "msx_dir_index.h"
+#include "game_issue_tags.h"
 #include "bios_loader.h"
 #include "FrameBuffer.h"
 #include "unzip.h"
@@ -16,12 +18,19 @@ extern "C" {
 #include <string>
 #include <unordered_set>
 #include <algorithm>
-#include <dirent.h>
 #include <sys/stat.h>
 #include <limits.h>
 #include <cstring>
+#include <ctime>
+#include <cctype>
 #ifdef _WIN32
 #include <windows.h>
+#include <direct.h>
+#include <process.h>
+#include <errno.h>
+#else
+#include <unistd.h>
+#include <sys/wait.h>
 #endif
 
 extern "C" {
@@ -46,9 +55,13 @@ extern "C" {
 extern void initVideo();
 extern void initSound();
 extern "C" void RefreshScreen(int);
-extern "C" void DrawMenu(const std::vector<std::string>& files, int selected, int offset, int biosMode);
+extern "C" void DrawMenu(const std::vector<std::string>* plainFiles, const std::vector<MsxDirGameEntry>* indexedEntries,
+                         int selected, int offset, int biosMode, const GameIssueTags* issueTags,
+                         const std::string* menuBaseDir, const MapperDb* mapperDb);
 extern "C" void* ioPortGetRef(int port);
 extern "C" void saveScreenshot(const char* filename);
+extern "C" int saveEmulationFramebufferPng(const char* filename);
+extern "C" int saveEmulationVramSnapshot(const char* filename);
 extern "C" void updateSound();
 extern "C" void clearQueuedAudio(void);
 extern "C" SDL_Window* getMainWindow();
@@ -121,6 +134,74 @@ int romBanks[4] = {0, 1, 2, 3};
 void startEmulator();
 
 static const char* kMapperDbPath = "mapper_db.csv";
+static const char* kGameIssueTagsPath = "game_issue_tags.txt";
+static GameIssueTags g_issueTags;
+
+static bool g_menuUseDirIndex = false;
+static std::vector<MsxDirGameEntry> g_menuEntries;
+
+static int menuEntryCount(const std::vector<std::string>& romFiles) {
+    return g_menuUseDirIndex ? (int)g_menuEntries.size() : (int)romFiles.size();
+}
+
+static const std::string& menuEntryFilename(const std::vector<std::string>& romFiles, int i) {
+    return g_menuUseDirIndex ? g_menuEntries[(size_t)i].filename : romFiles[(size_t)i];
+}
+
+static void ensureIssueCaptureDir(void) {
+#ifdef _WIN32
+    _mkdir("issue_captures");
+#else
+    mkdir("issue_captures", 0755);
+#endif
+}
+
+/** Sanitized ROM file name (no path) for issue_captures file names. */
+static std::string g_issueCaptureRomBase = "rom";
+
+static std::string stripRomExtensionForLabel(std::string s) {
+    if (s.size() < 5) return s;
+    std::string low = s;
+    for (char& c : low) c = (char)std::tolower((unsigned char)c);
+    static const char* exts[] = { ".rom", ".mx1", ".bin" };
+    for (const char* e : exts) {
+        size_t len = strlen(e);
+        if (low.size() >= len && low.compare(low.size() - len, len, e) == 0)
+            return s.substr(0, s.size() - len);
+    }
+    return s;
+}
+
+static std::string sanitizeIssueFileBase(std::string s) {
+    std::string out;
+    for (unsigned char c : s) {
+        if (c < 32 || c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' ||
+            c == '|')
+            out.push_back('_');
+        else
+            out.push_back((char)c);
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    while (!out.empty() && out.front() == ' ') out.erase(out.begin());
+    if (out.empty()) out = "rom";
+    if (out.size() > 120) out.resize(120);
+    return out;
+}
+
+static void setIssueCaptureRomBaseFromLoadedPath(const char* fullPath, const std::string* innerZipName) {
+    std::string label;
+    if (innerZipName && !innerZipName->empty()) {
+        label = *innerZipName;
+        size_t zslash = label.find_last_of("/\\");
+        if (zslash != std::string::npos) label = label.substr(zslash + 1);
+    } else {
+        std::string fn = fullPath;
+        size_t slash = fn.find_last_of("/\\");
+        label = (slash == std::string::npos) ? fn : fn.substr(slash + 1);
+    }
+    label = stripRomExtensionForLabel(std::move(label));
+    g_issueCaptureRomBase = sanitizeIssueFileBase(std::move(label));
+}
 
 /** ASCII8SRAM2 (openMSX RomAscii8_8 / ASCII8_2): 2 KiB SRAM at 0x8000–0xBFFF when enabled. */
 static const size_t kAscii8Sram2Size = 0x800;
@@ -145,11 +226,137 @@ static void resetAscii16Sram2Storage(void) {
     g_a16s2_enable = 0;
 }
 
-/** Menu defaults (also used when ROM has no DB row). See bios_loader.h for mode IDs. */
+/** Menu BIOS row; DB misses default to C-BIOS (1) when the cursor moves (see menuSyncBiosModeForMapperRow). */
 static unsigned char menuBiosMode = 0;
 /** Active session: applied in startEmulator and saved with F12. */
 static unsigned char g_biosMode = 0;
 static std::string g_romSearchBase = ".";
+/** Canonical path last passed to loadRom (for F9 openMSX -cart). */
+static std::string g_loadedRomFullPath;
+
+static std::string canonicalFilePathForShell(const std::string& p) {
+    if (p.empty()) return p;
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    if (GetFullPathNameA(p.c_str(), MAX_PATH, buf, NULL)) return std::string(buf);
+#else
+    char buf[PATH_MAX];
+    if (realpath(p.c_str(), buf)) return std::string(buf);
+#endif
+    return p;
+}
+
+static void setLoadedRomCanonicalPath(const char* filename) {
+    if (!filename || !*filename) {
+        g_loadedRomFullPath.clear();
+        return;
+    }
+    g_loadedRomFullPath = canonicalFilePathForShell(std::string(filename));
+}
+
+static std::string shellQuoteForSystem(const std::string& s) {
+    bool need = false;
+    for (unsigned char c : s) {
+        if (c <= (unsigned char)' ' || c == '"' || c == '\'' || c == '\\') {
+            need = true;
+            break;
+        }
+    }
+    if (!need) return s;
+#ifdef _WIN32
+    std::string o = "\"";
+    for (char c : s) {
+        if (c == '"')
+            o += "\"\"";
+        else
+            o += c;
+    }
+    o += '"';
+    return o;
+#else
+    std::string o = "'";
+    for (char c : s) {
+        if (c == '\'')
+            o += "'\\''";
+        else
+            o += c;
+    }
+    o += "'";
+    return o;
+#endif
+}
+
+static void spawnOpenMsxDetached(std::vector<std::string> args) {
+#ifdef _WIN32
+    std::vector<char*> av;
+    for (auto& s : args) av.push_back(&s[0]);
+    av.push_back(nullptr);
+    errno = 0;
+    intptr_t rc = _spawnvp(_P_DETACH, args[0].c_str(), av.data());
+    if (rc < 0)
+        printf("openMSX compare: spawn failed (%s)\n", strerror(errno));
+#else
+    pid_t p1 = fork();
+    if (p1 < 0) {
+        perror("openMSX compare: fork");
+        return;
+    }
+    if (p1 > 0) {
+        waitpid(p1, NULL, 0);
+        return;
+    }
+    if (setsid() < 0)
+        perror("openMSX compare: setsid");
+    pid_t p2 = fork();
+    if (p2 < 0)
+        _exit(1);
+    if (p2 > 0)
+        _exit(0);
+    std::vector<char*> av;
+    for (auto& s : args) av.push_back(&s[0]);
+    av.push_back(nullptr);
+    execvp(av[0], av.data());
+    perror("openMSX compare: execvp");
+    _exit(127);
+#endif
+    fflush(stdout);
+}
+
+static void launchOpenMsxComparePath(const std::string& cartPath, unsigned char biosMode) {
+    if (cartPath.empty()) {
+        printf("openMSX compare: empty cart path\n");
+        fflush(stdout);
+        return;
+    }
+    std::string cart = canonicalFilePathForShell(cartPath);
+#ifdef _WIN32
+    std::string exe = "openMSX\\derived\\openmsx.exe";
+#else
+    std::string exe = "openMSX/derived/openmsx";
+#endif
+    std::vector<std::string> argStorage;
+    argStorage.push_back(exe);
+    if (biosMode == 2) {
+        argStorage.push_back("-machine");
+        argStorage.push_back("Philips_VG_8020");
+    } else if (biosMode == 4) {
+        argStorage.push_back("-machine");
+        argStorage.push_back("Sony_HB-10");
+    }
+    argStorage.push_back("-cart");
+    argStorage.push_back(shellQuoteForSystem(cart));
+    argStorage.push_back("-command");
+    argStorage.push_back(shellQuoteForSystem("set scale_factor 1"));
+
+    std::string show;
+    for (size_t i = 0; i < argStorage.size(); ++i) {
+        if (i) show += ' ';
+        show += argStorage[i];
+    }
+    printf("openMSX compare: %s\n", show.c_str());
+    fflush(stdout);
+    spawnOpenMsxDetached(std::move(argStorage));
+}
 /** Per-ROM SHA1: DB bios row applied only on first load with a row; later loads use menu (B). */
 static std::unordered_set<std::string> g_basicFontDbHydratedSha1;
 
@@ -165,17 +372,66 @@ static void menuAdvanceBiosMode(void) {
     if (i >= n) i = 0;
     i = (i + 1) % n;
     menuBiosMode = kBiosCycleOrder[i];
+    g_biosMode = menuBiosMode;
+}
+
+/** Last menu row we applied mapper_db → menuBiosMode for (cursor movement). */
+static int g_menuSelForBiosSync = -1;
+
+/** ROM list cursor: DB hit → that row’s bios; DB miss → C-BIOS (1). */
+static void menuSyncBiosModeForMapperRow(const std::string& baseDir, const std::vector<std::string>& romFiles, int menuSel) {
+    if (menuSel < 0 || menuSel >= (int)romFiles.size()) return;
+    if (!g_mapperDbTriedLoad) {
+        g_mapperDb.load(kMapperDbPath);
+        g_mapperDbTriedLoad = true;
+    }
+    std::string full = baseDir + "/" + romFiles[(size_t)menuSel];
+    std::string sha1 = sha1HexFile(full.c_str());
+    if (sha1.empty()) {
+        menuBiosMode = 1;
+        g_biosMode = menuBiosMode;
+        return;
+    }
+    RomDbProfile prof;
+    if (!g_mapperDb.findProfile(sha1, prof)) {
+        menuBiosMode = 1;
+        g_biosMode = menuBiosMode;
+        return;
+    }
+    unsigned char bm = romDbProfileBiosMode(prof);
+    menuBiosMode = bm;
+    g_biosMode = menuBiosMode;
+}
+
+static void menuSyncBiosForSelection(const std::string& baseDir, const std::vector<std::string>& romFiles, int menuSel) {
+    if (g_menuUseDirIndex) {
+        if (menuSel < 0 || menuSel >= (int)g_menuEntries.size()) return;
+        if (!g_mapperDbTriedLoad) {
+            g_mapperDb.load(kMapperDbPath);
+            g_mapperDbTriedLoad = true;
+        }
+        const std::string& sh = g_menuEntries[(size_t)menuSel].sha1;
+        if (sh.empty()) {
+            menuBiosMode = 1;
+            g_biosMode = menuBiosMode;
+            return;
+        }
+        RomDbProfile prof;
+        if (g_mapperDb.findProfile(sh, prof))
+            menuBiosMode = romDbProfileBiosMode(prof);
+        else
+            menuBiosMode = romDbProfileBiosMode(g_menuEntries[(size_t)menuSel].prof);
+        g_biosMode = menuBiosMode;
+        return;
+    }
+    menuSyncBiosModeForMapperRow(baseDir, romFiles, menuSel);
 }
 
 static void applyMenuOrDbBasicFont(const std::string& sha1, bool haveProf, const RomDbProfile& prof) {
     if (haveProf) {
         if (g_basicFontDbHydratedSha1.find(sha1) == g_basicFontDbHydratedSha1.end()) {
             g_basicFontDbHydratedSha1.insert(sha1);
-            unsigned char bm = prof.biosMode;
-            /* Legacy mapper_db: bios=1 + font j/k meant Japanese C-BIOS main ROM */
-            if (bm == 1 && (prof.font == 'j' || prof.font == 'J' || prof.font == 'k' || prof.font == 'K'))
-                bm = 5;
-            if (bm > 5) bm = 0;
+            unsigned char bm = romDbProfileBiosMode(prof);
             g_biosMode = bm;
             menuBiosMode = bm;
         } else {
@@ -371,6 +627,7 @@ static void cycleMapperAndSoftReset() {
 }
 
 bool loadRom(const char* filename) {
+    g_loadedRomFullPath.clear();
     if (romData) { free(romData); romData = NULL; }
     if (strstr(filename, ".zip") || strstr(filename, ".ZIP")) {
         unzFile uf = unzOpen(filename);
@@ -391,7 +648,7 @@ bool loadRom(const char* filename) {
             std::string low = name;
             std::transform(low.begin(), low.end(), low.begin(), ::tolower);
             bool extOk = low.find(".rom") != std::string::npos || low.find(".mx1") != std::string::npos ||
-                         low.find(".bin") != std::string::npos;
+                         low.find(".mx2") != std::string::npos || low.find(".bin") != std::string::npos;
             if (extOk && info.uncompressed_size > 0)
                 zipCands.push_back(ZipRomCand{std::string(name), info.uncompressed_size});
         } while (unzGoToNextFile(uf) == UNZ_OK);
@@ -428,6 +685,8 @@ bool loadRom(const char* filename) {
         printf("loadRom: ZIP '%s' -> inner '%s' size=%d mapper=%s\n", filename, bestIt->name.c_str(), romSize,
                mapperTypeName(romMapper));
         fflush(stdout);
+        setIssueCaptureRomBaseFromLoadedPath(filename, &bestIt->name);
+        setLoadedRomCanonicalPath(filename);
         return true;
     } else {
         FILE* f = fopen(filename, "rb"); if (!f) return false;
@@ -447,6 +706,8 @@ bool loadRom(const char* filename) {
             g_romSearchBase = (slash == std::string::npos) ? std::string(".") : fn.substr(0, slash);
         }
         printf("loadRom: Loaded '%s', size=%d, mapper=%d\n", filename, romSize, romMapper); fflush(stdout);
+        setIssueCaptureRomBaseFromLoadedPath(filename, nullptr);
+        setLoadedRomCanonicalPath(filename);
         return true;
     }
 }
@@ -775,7 +1036,7 @@ void updateKeyboard() {
     if (s[SDL_SCANCODE_7]) keyMatrix[0] &= ~0x80;
     if (s[SDL_SCANCODE_8]) keyMatrix[1] &= ~0x01;
     if (s[SDL_SCANCODE_9]) keyMatrix[1] &= ~0x02;
-    if (s[SDL_SCANCODE_MINUS]) keyMatrix[1] &= ~0x04;
+    if (s[SDL_SCANCODE_MINUS]) keyMatrix[1] &= ~0x04; /* RCtrl → MSX -/_ */
     if (s[SDL_SCANCODE_EQUALS]) keyMatrix[1] &= ~0x08;
     if (s[SDL_SCANCODE_BACKSLASH]) keyMatrix[1] &= ~0x10;
     if (s[SDL_SCANCODE_LEFTBRACKET]) keyMatrix[1] &= ~0x20;
@@ -785,6 +1046,7 @@ void updateKeyboard() {
     if (s[SDL_SCANCODE_COMMA]) keyMatrix[2] &= ~0x04;
     if (s[SDL_SCANCODE_PERIOD]) keyMatrix[2] &= ~0x08;
     if (s[SDL_SCANCODE_SLASH]) keyMatrix[2] &= ~0x10;
+    if (s[SDL_SCANCODE_RCTRL]) keyMatrix[2] &= ~0x20;
     if (s[SDL_SCANCODE_A]) keyMatrix[2] &= ~0x40;
     if (s[SDL_SCANCODE_B]) keyMatrix[2] &= ~0x80;
     if (s[SDL_SCANCODE_C]) keyMatrix[3] &= ~0x01;
@@ -812,7 +1074,7 @@ void updateKeyboard() {
     if (s[SDL_SCANCODE_Y]) keyMatrix[5] &= ~0x40;
     if (s[SDL_SCANCODE_Z]) keyMatrix[5] &= ~0x80;
     if (s[SDL_SCANCODE_LSHIFT] || s[SDL_SCANCODE_RSHIFT]) keyMatrix[6] &= ~0x01;
-    if (s[SDL_SCANCODE_LCTRL] || s[SDL_SCANCODE_RCTRL]) keyMatrix[6] &= ~0x02;
+    if (s[SDL_SCANCODE_LCTRL]) keyMatrix[6] &= ~0x02;
     if (s[SDL_SCANCODE_LALT]) keyMatrix[6] &= ~0x04;
     if (s[SDL_SCANCODE_F1]) keyMatrix[6] &= ~0x20;
     if (s[SDL_SCANCODE_F2]) keyMatrix[6] &= ~0x40;
@@ -901,16 +1163,8 @@ void startEmulator() {
     }
     printf("startEmulator: primarySlot=0x%02X (CPU reset PC=0000h → BIOS entry; 4000h–BFFF cart when megaROM)\n", primarySlot);
     fflush(stdout);
-    RefreshScreen(0);
-}
-
-static std::vector<std::string> scanDirectory(const char* path) {
-    std::vector<std::string> files; DIR* dir = opendir(path); if (!dir) return files;
-    struct dirent* ent; while ((ent = readdir(dir)) != NULL) {
-        std::string name = ent->d_name; std::string low = name; std::transform(low.begin(), low.end(), low.begin(), ::tolower);
-        if (low.find(".rom") != std::string::npos || low.find(".zip") != std::string::npos || low.find(".mx1") != std::string::npos) files.push_back(name);
-    }
-    closedir(dir); std::sort(files.begin(), files.end()); return files;
+    /* Force full GL paint before first VBLANK (onDisplay also calls RefreshScreen each frame). */
+    RefreshScreen(-1);
 }
 
 static void saveLastGame(const char* filename) { FILE* f = fopen("last_game.txt", "w"); if (f) { fprintf(f, "%s", filename); fclose(f); } }
@@ -942,7 +1196,8 @@ static void menuResetGamepadNavState(void) {
 
 static void menuUpdateGamepad(std::vector<std::string>& romFiles, int& menuSel, int& menuOff,
     const std::string& baseDir, bool& quit, AppState& appState) {
-    if (!g_gameController || romFiles.empty()) return;
+    const int n = menuEntryCount(romFiles);
+    if (!g_gameController || n <= 0) return;
     SDL_GameController* gc = g_gameController;
     const int pageSize = MSXPLAY_MENU_PAGE_SIZE;
 
@@ -978,29 +1233,29 @@ static void menuUpdateGamepad(std::vector<std::string>& romFiles, int& menuSel, 
         else if (dir == 2) menuSel++;
         else if (dir == 3) menuSel -= pageSize;
         else if (dir == 4) menuSel += pageSize;
-        menuClampSelection(menuSel, menuOff, (int)romFiles.size(), pageSize);
+        menuClampSelection(menuSel, menuOff, n, pageSize);
     } else if (g_menuNavNext != 0 && (Int32)(now - g_menuNavNext) >= 0) {
         g_menuNavNext = now + 90;
         if (dir == 1) menuSel--;
         else if (dir == 2) menuSel++;
         else if (dir == 3) menuSel -= pageSize;
         else if (dir == 4) menuSel += pageSize;
-        menuClampSelection(menuSel, menuOff, (int)romFiles.size(), pageSize);
+        menuClampSelection(menuSel, menuOff, n, pageSize);
     }
 
     if (edge(SDL_CONTROLLER_BUTTON_LEFTSHOULDER)) {
         menuSel -= pageSize;
-        menuClampSelection(menuSel, menuOff, (int)romFiles.size(), pageSize);
+        menuClampSelection(menuSel, menuOff, n, pageSize);
     }
     if (edge(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) {
         menuSel += pageSize;
-        menuClampSelection(menuSel, menuOff, (int)romFiles.size(), pageSize);
+        menuClampSelection(menuSel, menuOff, n, pageSize);
     }
 
     if (edge(SDL_CONTROLLER_BUTTON_A) || edge(SDL_CONTROLLER_BUTTON_START)) {
-        std::string full = baseDir + "/" + romFiles[menuSel];
+        std::string full = baseDir + "/" + menuEntryFilename(romFiles, menuSel);
         if (loadRom(full.c_str())) {
-            saveLastGame(romFiles[menuSel].c_str());
+            saveLastGame(menuEntryFilename(romFiles, menuSel).c_str());
             startEmulator();
             appState = STATE_EMU;
         }
@@ -1008,7 +1263,7 @@ static void menuUpdateGamepad(std::vector<std::string>& romFiles, int& menuSel, 
     if (edge(SDL_CONTROLLER_BUTTON_B))
         menuAdvanceBiosMode();
     if (edge(SDL_CONTROLLER_BUTTON_X)) {
-        std::string full = baseDir + "/" + romFiles[menuSel];
+        std::string full = baseDir + "/" + menuEntryFilename(romFiles, menuSel);
 #ifdef _WIN32
         char resolved_path[MAX_PATH];
         if (_fullpath(resolved_path, full.c_str(), MAX_PATH))
@@ -1042,25 +1297,44 @@ int main_emu(int argc, char* argv[]) {
     tryOpenFirstGameController();
     initVideo(); initSound();
     biosLoaderInit();
-    std::vector<std::string> romFiles; int menuSel = 0, menuOff = 0; std::string baseDir = targetPath;
-    if (pathIsFile) { if (loadRom(targetPath)) { startEmulator(); appState = STATE_EMU; } }
-    else {
-        romFiles = scanDirectory(targetPath);
-        if (romFiles.empty()) appState = STATE_EMU;
+    g_issueTags.load(kGameIssueTagsPath);
+    std::vector<std::string> romFiles;
+    int menuSel = 0, menuOff = 0;
+    std::string baseDir = targetPath;
+    g_menuUseDirIndex = false;
+    g_menuEntries.clear();
+    if (pathIsFile) {
+        if (loadRom(targetPath)) {
+            startEmulator();
+            appState = STATE_EMU;
+        }
+    } else {
+        baseDir = targetPath;
+        if (!g_mapperDbTriedLoad) {
+            g_mapperDb.load(kMapperDbPath);
+            g_mapperDbTriedLoad = true;
+        }
+        msxDirLoadOrBuildIndex(baseDir, g_mapperDb, g_issueTags, g_menuEntries);
+        g_menuUseDirIndex = true;
+        romFiles.clear();
+        if (g_menuEntries.empty())
+            appState = STATE_EMU;
         else {
             appState = STATE_MENU;
             std::string last = loadLastGame();
             if (!last.empty()) {
-                auto it = std::find(romFiles.begin(), romFiles.end(), last);
-                if (it != romFiles.end()) {
-                    menuSel = std::distance(romFiles.begin(), it);
-                    menuOff = (menuSel / MSXPLAY_MENU_PAGE_SIZE) * MSXPLAY_MENU_PAGE_SIZE;
+                for (size_t i = 0; i < g_menuEntries.size(); ++i) {
+                    if (g_menuEntries[i].filename == last) {
+                        menuSel = (int)i;
+                        menuOff = (menuSel / MSXPLAY_MENU_PAGE_SIZE) * MSXPLAY_MENU_PAGE_SIZE;
+                        break;
+                    }
                 }
             }
         }
     }
     bool quit = false, fullscreen = false; SDL_Event e; Uint32 lastTime = SDL_GetTicks();
-    printf("main: B=cycle BIOS (emb/C-BIOS/C-BIOS JP/VG8020/main+logo/HB-10)  Ctrl+F5  F12=db\n"); fflush(stdout);
+    printf("main: B=cycle BIOS  F6=reset  F7=menu  F9=openMSX(menu+emu)  Ctrl+F5=mapper  F12=db  Alt+F4=quit  E/U=mark  PNG+.vram in emu\n"); fflush(stdout);
     while (!quit) {
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) quit = true;
@@ -1078,7 +1352,8 @@ int main_emu(int argc, char* argv[]) {
                 }
             }
             if (e.type == SDL_KEYDOWN) {
-                if (e.key.keysym.sym == SDLK_ESCAPE) quit = true;
+                if (e.key.keysym.sym == SDLK_F4 && (e.key.keysym.mod & KMOD_ALT))
+                    quit = true;
                 if (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)) {
                     fullscreen = !fullscreen; SDL_SetWindowFullscreen(getMainWindow(), fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
                 }
@@ -1088,13 +1363,17 @@ int main_emu(int argc, char* argv[]) {
                     else if (e.key.keysym.sym == SDLK_PAGEUP || e.key.keysym.sym == SDLK_LEFT) menuSel -= pageSize;
                     else if (e.key.keysym.sym == SDLK_PAGEDOWN || e.key.keysym.sym == SDLK_RIGHT) menuSel += pageSize;
                     else if (e.key.keysym.sym == SDLK_RETURN) {
-                        std::string full = baseDir + "/" + romFiles[menuSel];
-                        if (loadRom(full.c_str())) { saveLastGame(romFiles[menuSel].c_str()); startEmulator(); appState = STATE_EMU; }
+                        std::string full = baseDir + "/" + menuEntryFilename(romFiles, menuSel);
+                        if (loadRom(full.c_str())) {
+                            saveLastGame(menuEntryFilename(romFiles, menuSel).c_str());
+                            startEmulator();
+                            appState = STATE_EMU;
+                        }
                     } else if (e.key.keysym.sym == SDLK_b && !(e.key.keysym.mod & KMOD_CTRL)) {
                         menuAdvanceBiosMode();
                     } else if (e.key.keysym.sym == SDLK_c && (e.key.keysym.mod & KMOD_CTRL)) {
-                        if (!romFiles.empty() && menuSel >= 0 && menuSel < (int)romFiles.size()) {
-                            std::string full = baseDir + "/" + romFiles[menuSel];
+                        if (menuEntryCount(romFiles) > 0 && menuSel >= 0 && menuSel < menuEntryCount(romFiles)) {
+                            std::string full = baseDir + "/" + menuEntryFilename(romFiles, menuSel);
 #ifdef _WIN32
                             char resolved_path[MAX_PATH];
                             if (_fullpath(resolved_path, full.c_str(), MAX_PATH)) {
@@ -1107,20 +1386,133 @@ int main_emu(int argc, char* argv[]) {
                             }
 #endif
                         }
+                    } else if (e.key.keysym.sym == SDLK_e && !(e.key.keysym.mod & KMOD_CTRL)) {
+                        if (menuEntryCount(romFiles) > 0 && menuSel >= 0 && menuSel < menuEntryCount(romFiles)) {
+                            if (g_menuUseDirIndex) {
+                                std::string sh = g_menuEntries[(size_t)menuSel].sha1;
+                                if (sh.empty())
+                                    printf("game_issue_tags: no cart hash for %s\n",
+                                        g_menuEntries[(size_t)menuSel].filename.c_str());
+                                else if (g_issueTags.add(sh)) {
+                                    g_menuEntries[(size_t)menuSel].issue = true;
+                                    msxDirWriteIndex(baseDir, g_menuEntries);
+                                    printf("game_issue_tags: marked %s (%s)\n", sh.c_str(),
+                                        g_menuEntries[(size_t)menuSel].filename.c_str());
+                                } else
+                                    printf("game_issue_tags: already marked %s\n", sh.c_str());
+                            } else {
+                                std::string full = baseDir + "/" + menuEntryFilename(romFiles, menuSel);
+                                std::string sh = sha1HexFile(full.c_str());
+                                if (sh.empty())
+                                    printf("game_issue_tags: cannot read/hash %s\n", full.c_str());
+                                else if (g_issueTags.add(sh))
+                                    printf("game_issue_tags: marked %s (%s)\n", sh.c_str(),
+                                        menuEntryFilename(romFiles, menuSel).c_str());
+                                else
+                                    printf("game_issue_tags: already marked %s\n", sh.c_str());
+                            }
+                            fflush(stdout);
+                        }
+                    } else if (e.key.keysym.sym == SDLK_u && !(e.key.keysym.mod & KMOD_CTRL)) {
+                        if (menuEntryCount(romFiles) > 0 && menuSel >= 0 && menuSel < menuEntryCount(romFiles)) {
+                            if (g_menuUseDirIndex) {
+                                std::string sh = g_menuEntries[(size_t)menuSel].sha1;
+                                if (sh.empty())
+                                    printf("game_issue_tags: no cart hash for %s\n",
+                                        g_menuEntries[(size_t)menuSel].filename.c_str());
+                                else if (g_issueTags.remove(sh)) {
+                                    g_menuEntries[(size_t)menuSel].issue = false;
+                                    msxDirWriteIndex(baseDir, g_menuEntries);
+                                    printf("game_issue_tags: unmarked %s (%s)\n", sh.c_str(),
+                                        g_menuEntries[(size_t)menuSel].filename.c_str());
+                                } else
+                                    printf("game_issue_tags: not marked %s\n", sh.c_str());
+                            } else {
+                                std::string full = baseDir + "/" + menuEntryFilename(romFiles, menuSel);
+                                std::string sh = sha1HexFile(full.c_str());
+                                if (sh.empty())
+                                    printf("game_issue_tags: cannot read/hash %s\n", full.c_str());
+                                else if (g_issueTags.remove(sh))
+                                    printf("game_issue_tags: unmarked %s (%s)\n", sh.c_str(),
+                                        menuEntryFilename(romFiles, menuSel).c_str());
+                                else
+                                    printf("game_issue_tags: not marked %s\n", sh.c_str());
+                            }
+                            fflush(stdout);
+                        }
+                    } else if (e.key.keysym.sym == SDLK_F9) {
+                        if (menuEntryCount(romFiles) > 0 && menuSel >= 0 && menuSel < menuEntryCount(romFiles)) {
+                            std::string full = baseDir + "/" + menuEntryFilename(romFiles, menuSel);
+                            launchOpenMsxComparePath(full, menuBiosMode);
+                        } else {
+                            printf("openMSX compare: no game selected\n");
+                            fflush(stdout);
+                        }
                     }
                     if (menuSel < 0) menuSel = 0;
-                    if (menuSel >= (int)romFiles.size()) menuSel = (int)romFiles.size() - 1;
+                    {
+                        const int mc = menuEntryCount(romFiles);
+                        if (mc > 0) {
+                            if (menuSel >= mc) menuSel = mc - 1;
+                        } else
+                            menuSel = 0;
+                    }
                     if (menuSel < menuOff) menuOff = menuSel;
                     if (menuSel >= menuOff + pageSize) menuOff = menuSel - pageSize + 1;
                 } else {
+                    if (e.key.keysym.sym == SDLK_F6)
+                        startEmulator();
                     if (e.key.keysym.sym == SDLK_F7) {
-                        if (!romFiles.empty()) {
+                        if (menuEntryCount(romFiles) > 0) {
                             appState = STATE_MENU;
                             menuResetGamepadNavState();
-                        } else startEmulator();
+                            g_menuSelForBiosSync = -1;
+                        } else
+                            startEmulator();
+                    }
+                    if (e.key.keysym.sym == SDLK_F9) {
+                        if (g_loadedRomFullPath.empty()) {
+                            printf("openMSX compare: no ROM loaded\n");
+                            fflush(stdout);
+                        } else
+                            launchOpenMsxComparePath(g_loadedRomFullPath, g_biosMode);
                     }
                     if (e.key.keysym.sym == SDLK_F8) scanlinesEnabled = !scanlinesEnabled;
                     if (e.key.keysym.sym == SDLK_PRINTSCREEN) { saveVramSc2("capture.sc2"); saveScreenshot("capture.bmp"); }
+                    if (e.key.keysym.sym == SDLK_e && !(e.key.keysym.mod & KMOD_CTRL) && romData && romSize > 0) {
+                        std::string sh = sha1Hex(romData, (size_t)romSize);
+                        if (g_issueTags.add(sh))
+                            printf("game_issue_tags: marked %s\n", sh.c_str());
+                        else
+                            printf("game_issue_tags: already marked %s\n", sh.c_str());
+                        ensureIssueCaptureDir();
+                        char stamp[16];
+                        std::time_t tsec = std::time(nullptr);
+                        std::tm* ltp = nullptr;
+#ifdef _WIN32
+                        std::tm ltBuf;
+                        if (localtime_s(&ltBuf, &tsec) == 0) ltp = &ltBuf;
+#else
+                        ltp = std::localtime(&tsec);
+#endif
+                        if (!ltp || std::strftime(stamp, sizeof(stamp), "%y%m%d%H%M%S", ltp) < 12) {
+                            printf("game_issue_tags: local time stamp failed\n");
+                            fflush(stdout);
+                        } else {
+                        char pngPath[384], vramPath[384];
+                        snprintf(pngPath, sizeof(pngPath), "issue_captures/%s_%s.png", g_issueCaptureRomBase.c_str(), stamp);
+                        snprintf(vramPath, sizeof(vramPath), "issue_captures/%s_%s.vram", g_issueCaptureRomBase.c_str(), stamp);
+                        if (saveEmulationFramebufferPng(pngPath))
+                            printf("game_issue_tags: saved %s\n", pngPath);
+                        else
+                            printf("game_issue_tags: PNG save failed %s\n", pngPath);
+                        if (saveEmulationVramSnapshot(vramPath))
+                            printf("game_issue_tags: saved %s\n", vramPath);
+                        else
+                            printf("game_issue_tags: VRAM snapshot failed %s\n", vramPath);
+                        fflush(stdout);
+                        }
+                    }
                     if (e.key.keysym.sym == SDLK_F5 && (e.key.keysym.mod & KMOD_CTRL)) cycleMapperAndSoftReset();
                     if (e.key.keysym.sym == SDLK_F12 && romData) {
                         if (!g_mapperDbTriedLoad) {
@@ -1130,12 +1522,16 @@ int main_emu(int argc, char* argv[]) {
                         std::string sha1 = sha1Hex(romData, romSize);
                         RomDbProfile saveProf;
                         saveProf.mapper = romMapper;
-                        saveProf.biosMode = g_biosMode;
-                        saveProf.font = 'e';
+                        romDbProfileFromSessionBios(saveProf, g_biosMode);
                         if (g_mapperDb.upsertProfile(kMapperDbPath, sha1, saveProf)) {
                             g_mapperDb.load(kMapperDbPath);
-                            printf("mapper_db: saved %s -> %s bios=%u\n", sha1.c_str(), mapperTypeName(romMapper),
-                                   (unsigned)g_biosMode);
+                            printf("mapper_db: saved %s -> %s %s,%c (biosMode=%u)\n", sha1.c_str(),
+                                   mapperTypeName(romMapper), saveProf.msxBasic ? "basic" : "none",
+                                   (saveProf.font == 'j' || saveProf.font == 'k') ? 'j' : 'e',
+                                   (unsigned)romDbProfileBiosMode(saveProf));
+                            if (g_menuUseDirIndex)
+                                msxDirSyncAfterMainDbSave(baseDir, sha1, romMapper, saveProf, g_mapperDb, g_issueTags,
+                                    &g_menuEntries);
                         } else {
                             printf("mapper_db: failed to write %s\n", kMapperDbPath);
                         }
@@ -1153,12 +1549,26 @@ int main_emu(int argc, char* argv[]) {
                     handleHLE(cpu); 
                     while (updateTimers(currentBoardTime));
                 }
-                RefreshScreen(0); updateSound(); lastTime = now;
+                /* Video: blueberry VDP onDisplay() invokes RefreshScreen at vblank only — do not duplicate here. */
+                updateSound(); lastTime = now;
             } else SDL_Delay(1);
         } else {
-            if (appState == STATE_MENU)
+            if (appState == STATE_MENU) {
                 menuUpdateGamepad(romFiles, menuSel, menuOff, baseDir, quit, appState);
-            DrawMenu(romFiles, menuSel, menuOff, (int)menuBiosMode);
+                if (menuEntryCount(romFiles) > 0 && menuSel != g_menuSelForBiosSync) {
+                    g_menuSelForBiosSync = menuSel;
+                    menuSyncBiosForSelection(baseDir, romFiles, menuSel);
+                }
+            }
+            if (!g_mapperDbTriedLoad) {
+                g_mapperDb.load(kMapperDbPath);
+                g_mapperDbTriedLoad = true;
+            }
+            if (g_menuUseDirIndex)
+                DrawMenu(nullptr, &g_menuEntries, menuSel, menuOff, (int)menuBiosMode, &g_issueTags, &baseDir,
+                    &g_mapperDb);
+            else
+                DrawMenu(&romFiles, nullptr, menuSel, menuOff, (int)menuBiosMode, &g_issueTags, &baseDir, &g_mapperDb);
             SDL_Delay(16);
         }
     }
@@ -1170,7 +1580,8 @@ void handleHLE(R800* cpu) {
     if (cpu->regs.PC.W == 0x005C) {
         UInt16 count = cpu->regs.BC.W, dest = cpu->regs.DE.W, src = cpu->regs.HL.W;
         writeIoPort(NULL, 0x99, dest & 0xFF); writeIoPort(NULL, 0x99, (dest >> 8) | 0x40);
-        for (UInt16 i = 0; i < count; i++) writeIoPort(NULL, 0x98, readMemory(NULL, src + i));
+        for (UInt16 i = 0; i < count; i++)
+            writeIoPort(NULL, 0x98, readMemory(NULL, src + i));
         cpu->regs.HL.W += count; cpu->regs.DE.W += count; cpu->regs.BC.W = 0;
         UInt16 sp = cpu->regs.SP.W; cpu->regs.PC.W = readMemory(NULL, sp) | (readMemory(NULL, sp + 1) << 8); cpu->regs.SP.W = sp + 2;
     }

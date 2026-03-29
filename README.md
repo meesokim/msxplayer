@@ -10,15 +10,17 @@ A lightweight, standalone MSX1/2 emulator core integrated with SDL2, featuring h
   - Full support for 16×16 and 32×32 (magnified) sprites with Early Clock (EC) bit clipping.
 - **MegaROM / Mapper Support**:
   - **Konami**, **Konami SCC**, **ASCII8**, **ASCII16**, **ASCII16 SRAM**, **MSX-DOS 2 / MSX-WRITE**, **PAGE2** (8 KiB ROM at `8000h`), **mirrored** small ROMs, and **R-Type (Irem)**-style **RTYPE** mapper (openMSX `RomRType`: 16 KiB banks, fixed `4000h–7FFFh` page, switchable `8000h–BFFFh`).
-  - **Mapper database** (`mapper_db.csv`): SHA-1–based profiles (mapper type, BIOS mode, font). Includes entries for **R-Type** and **Scion** (Mirrored) among others.
+  - **Mapper database** (`mapper_db.csv`): SHA-1 rows with **mapper**, **basic vs C-BIOS family** (`basic` → MSX BASIC machines / `none` → C-BIOS-style), and **font** (`e` intl / `j` JP). The menu syncs the highlighted ROM’s profile into the active BIOS choice; **F12** in emulation writes the **current mapper + session BIOS** back into the CSV (and refreshes the in-memory DB / directory index when used).
   - **Ctrl+F5**: Cycle mapper mode when a ROM is not in the database (includes `RTYPE`, megaROM order, etc.).
 - **Enhanced User Experience**:
-  - **Game Selection Menu**: ROM browser with keyboard navigation.
-  - **CBIOS Integration**: Optional C-BIOS and other BIOS modes via loader.
+  - **Game Selection Menu**: ROM browser with keyboard navigation; **B** cycles BIOS preset for the next launch; **Ctrl+C** copies the resolved full path of the highlighted ROM.
+  - **BIOS loader** (`bios_loader`): Modes include embedded fallback, **C-BIOS** (intl / main+logo / JP), **Philips VG-8020**-style, and **Sony HB-10**-style BASIC ROM layouts. `biosLoaderInit` snapshots linked BIOS assets before ROM swaps.
+  - **openMSX compare (F9)**: Spawns a **detached** openMSX process (no blocking `system()` shell): expects `openMSX/derived/openmsx` (Linux) or `openMSX\derived\openmsx.exe` (Windows) next to the working directory. Passes **`-cart`** with a canonical path and **`-machine`** for VG-8020 / HB-10–aligned runs when those BIOS modes are active. Works from the **menu** (selected game + menu BIOS) and from **emulation** (loaded ROM + session BIOS).
+  - **Issue tagging**: **E** marks / **U** unmarks the current ROM by SHA-1 (`game_issue_tags`); in emulation, **E** also writes a timestamped **PNG + `.vram` snapshot** under `issue_captures/` (each press, for diagnosis).
   - **Last Game Persistence**: `last_game.txt`.
   - **Fullscreen**: `Alt+Enter`.
   - **Scanlines**: `F8`.
-- **Standalone / BIOS**: Embedded BIOS paths and loader improvements for portable builds.
+- **Standalone / BIOS**: Embedded BIOS paths and loader behavior aimed at portable builds.
 - **Enhanced ROM Compatibility**:
   - Mirrored `<64 KiB` ROM handling aligned with openMSX `RomPlain` heuristics (`g_mirroredFirstPage`).
   - Plain 16/32 KiB and header-based detection.
@@ -29,7 +31,7 @@ A lightweight, standalone MSX1/2 emulator core integrated with SDL2, featuring h
   - **Print Screen**: VRAM dump / screenshot.
   - **VRAM Viewer**: `-v`.
   - **Debug**: `-d`.
-  - **verify_core** / **verify_tools**: Mapper and VRAM unit checks (`make verify`, `make verify-tools`).
+  - **verify_core** / **verify_tools**: Mapper and VRAM-focused checks (`make verify`, `make verify-tools`).
 - **Portability**:
   - ZIP loading.
   - **Linux** and **Windows** builds (MinGW cross-compile; see Makefile).
@@ -78,15 +80,36 @@ make msxplay.exe
 ./msxplay -d "Game.rom"
 ```
 
+**F9** looks for a built openMSX binary at `openMSX/derived/openmsx` (or `openMSX\derived\openmsx.exe` on Windows) relative to the **current working directory**, so launch msxplay from the project root if you keep openMSX there.
+
 ### Controls
+
+**In game**
 
 - **Arrows** — movement  
 - **SPACE / Z** — button A  
 - **X** — button B  
 - **1 / 2** — start (1P / 2P)  
-- **Print Screen** — capture  
-- **Ctrl+F5** — cycle mapper (if ROM not in DB)  
+- **Print Screen** — VRAM dump + BMP screenshot  
+- **F6** — soft reset  
+- **F7** — return to game menu (if a ROM list exists)  
+- **F8** — toggle scanlines  
+- **F9** — launch **openMSX** with the same cartridge and session BIOS (detached; see Features)  
+- **F12** — save current ROM’s **mapper + BIOS profile** to `mapper_db.csv`  
+- **Ctrl+F5** — cycle mapper (if ROM not in DB) and reset  
+- **E** — mark ROM in issue set; saves PNG / VRAM snapshot under `issue_captures/`  
+- **Alt+Enter** — fullscreen  
+- **Alt+F4** — quit  
 - **ESC** — quit  
+
+**In menu**
+
+- **Arrows / PgUp / PgDn** — move selection  
+- **Enter** — run selected ROM  
+- **B** — cycle BIOS preset for the next run  
+- **Ctrl+C** — copy full path of highlighted ROM  
+- **E** / **U** — mark / unmark issue tag for highlighted ROM  
+- **F9** — openMSX compare for highlighted ROM (uses menu BIOS)  
 
 ## Project Architecture
 

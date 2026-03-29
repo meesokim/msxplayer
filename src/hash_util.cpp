@@ -1,5 +1,6 @@
 #include "hash_util.h"
 
+#include <cstdio>
 #include <sstream>
 #include <iomanip>
 
@@ -67,4 +68,30 @@ std::string sha1Hex(const UInt8* data, size_t size) {
 
 std::string sha1Hex(const std::vector<UInt8>& data) {
     return sha1Hex(data.data(), data.size());
+}
+
+std::string sha1HexFile(const char* path) {
+    if (!path) return "";
+    FILE* f = std::fopen(path, "rb");
+    if (!f) return "";
+    if (std::fseek(f, 0, SEEK_END) != 0) {
+        std::fclose(f);
+        return "";
+    }
+    long sz = std::ftell(f);
+    if (sz < 0) {
+        std::fclose(f);
+        return "";
+    }
+    if (std::fseek(f, 0, SEEK_SET) != 0) {
+        std::fclose(f);
+        return "";
+    }
+    std::vector<UInt8> buf((size_t)sz);
+    if (sz > 0 && std::fread(buf.data(), 1, buf.size(), f) != buf.size()) {
+        std::fclose(f);
+        return "";
+    }
+    std::fclose(f);
+    return sha1Hex(buf.data(), buf.size());
 }

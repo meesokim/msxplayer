@@ -4,6 +4,7 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include <cctype>
 
 static std::string trim(const std::string& s) {
     size_t b = 0;
@@ -11,6 +12,15 @@ static std::string trim(const std::string& s) {
     size_t e = s.size();
     while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n')) e--;
     return s.substr(b, e - b);
+}
+
+static std::string normalizeSha1Key(const std::string& s) {
+    std::string o = trim(s);
+    for (size_t i = 0; i < o.size(); i++) {
+        char c = o[i];
+        if (c >= 'A' && c <= 'Z') o[i] = (char)(c + 32);
+    }
+    return o;
 }
 
 static std::string toLower(std::string s) {
@@ -21,12 +31,7 @@ static std::string toLower(std::string s) {
     return s;
 }
 
-static bool parseBoolField(const std::string& s) {
-    std::string t = toLower(trim(s));
-    return t == "1" || t == "true" || t == "yes" || t == "on";
-}
-
-static char parseFontField(const std::string& s) {
+static char parseFontFieldLegacy(const std::string& s) {
     std::string t = trim(s);
     if (t.empty()) return 'e';
     char c = (char)t[0];
@@ -35,11 +40,109 @@ static char parseFontField(const std::string& s) {
     return 'e';
 }
 
-/** CSV column "basic": legacy 0/1 or digit 0-5 (bios bundle; 5 = C-BIOS JP). */
-static unsigned char parseBiosModeField(const std::string& s) {
-    std::string t = trim(s);
-    if (t.size() == 1 && t[0] >= '0' && t[0] <= '5') return (unsigned char)(t[0] - '0');
-    return parseBoolField(s) ? (unsigned char)1 : (unsigned char)0;
+static char ejFromFontChar(char c) {
+    if (c == 'j' || c == 'J' || c == 'k' || c == 'K') return 'j';
+    return 'e';
+}
+
+static char parseEjField(const std::string& s) {
+    return ejFromFontChar(parseFontFieldLegacy(s));
+}
+
+unsigned char romDbProfileBiosMode(const RomDbProfile& p) {
+    bool jp = (p.font == 'j' || p.font == 'J' || p.font == 'k' || p.font == 'K');
+    if (p.msxBasic)
+        return jp ? (unsigned char)4 : (unsigned char)2;
+    return jp ? (unsigned char)5 : (unsigned char)1;
+}
+
+void romDbProfileFromSessionBios(RomDbProfile& p, unsigned char biosMode) {
+    p.msxBasic = false;
+    p.font = 'e';
+    switch (biosMode) {
+        case 2:
+            p.msxBasic = true;
+            p.font = 'e';
+            break;
+        case 4:
+            p.msxBasic = true;
+            p.font = 'j';
+            break;
+        case 5:
+            p.msxBasic = false;
+            p.font = 'j';
+            break;
+        case 0:
+        case 1:
+        case 3:
+        default:
+            p.msxBasic = false;
+            p.font = 'e';
+            break;
+    }
+}
+
+static void applyLegacyDigitBios(RomDbProfile& prof, unsigned char bm, char fontRaw) {
+    char fj = ejFromFontChar(fontRaw);
+    prof.font = fj;
+    switch (bm) {
+        case 0:
+            prof.msxBasic = false;
+            prof.font = 'e';
+            break;
+        case 1:
+            prof.msxBasic = false;
+            prof.font = fj;
+            break;
+        case 2:
+            prof.msxBasic = true;
+            prof.font = 'e';
+            break;
+        case 3:
+            prof.msxBasic = false;
+            prof.font = 'e';
+            break;
+        case 4:
+            prof.msxBasic = true;
+            prof.font = 'j';
+            break;
+        case 5:
+            prof.msxBasic = false;
+            prof.font = 'j';
+            break;
+        default:
+            prof.msxBasic = false;
+            prof.font = 'e';
+            break;
+    }
+}
+
+static bool parseBasicNoneToken(const std::string& s, bool* outBasic) {
+    std::string t = toLower(trim(s));
+    if (t == "basic") {
+        *outBasic = true;
+        return true;
+    }
+    if (t == "none") {
+        *outBasic = false;
+        return true;
+    }
+    return false;
+}
+
+const char* romDbBiosShortLabel(const RomDbProfile& p) {
+    switch (romDbProfileBiosMode(p)) {
+        case 1: return "C-BIOS";
+        case 2: return "VG8020";
+        case 4: return "HB-10";
+        case 5: return "C-BIOS JP";
+        default: return "C-BIOS";
+    }
+}
+
+void romDbFormatMenuMeta(const RomDbProfile& p, char* out, size_t outSz) {
+    if (!out || outSz < 4) return;
+    snprintf(out, outSz, "%s | %s", mapperTypeName(p.mapper), romDbBiosShortLabel(p));
 }
 
 const char* mapperTypeName(MapperType mapper) {
@@ -96,34 +199,56 @@ bool MapperDb::load(const std::string& path) {
         std::vector<std::string> p;
         splitCsv(line, p);
         if (p.size() < 2) continue;
-        if (p[0].size() != 40) continue;
+        std::string shaKey = normalizeSha1Key(p[0]);
+        if (shaKey.size() != 40) continue;
         RomDbProfile prof;
         prof.mapper = mapperTypeFromName(p[1]);
-        prof.biosMode = p.size() >= 3 ? parseBiosModeField(p[2]) : (unsigned char)0;
-        prof.font = p.size() >= 4 ? parseFontField(p[3]) : 'e';
-        profiles_[p[0]] = prof;
+        bool basicTok = false;
+        if (p.size() >= 4 && parseBasicNoneToken(p[2], &basicTok)) {
+            prof.msxBasic = basicTok;
+            prof.font = parseEjField(p[3]);
+        } else if (p.size() >= 3) {
+            std::string t2 = trim(p[2]);
+            if (t2.size() == 1 && t2[0] >= '0' && t2[0] <= '5') {
+                unsigned char bm = (unsigned char)(t2[0] - '0');
+                char fr = p.size() >= 4 ? (char)parseFontFieldLegacy(p[3]) : 'e';
+                applyLegacyDigitBios(prof, bm, fr);
+            } else {
+                prof.msxBasic = false;
+                prof.font = 'e';
+            }
+        } else {
+            prof.msxBasic = false;
+            prof.font = 'e';
+        }
+        profiles_[shaKey] = prof;
     }
     fclose(f);
     return true;
 }
 
 bool MapperDb::find(const std::string& sha1, MapperType& mapper) const {
-    auto it = profiles_.find(sha1);
+    std::string key = normalizeSha1Key(sha1);
+    if (key.size() != 40) return false;
+    auto it = profiles_.find(key);
     if (it == profiles_.end()) return false;
     mapper = it->second.mapper;
     return true;
 }
 
 bool MapperDb::findProfile(const std::string& sha1, RomDbProfile& out) const {
-    auto it = profiles_.find(sha1);
+    std::string key = normalizeSha1Key(sha1);
+    if (key.size() != 40) return false;
+    auto it = profiles_.find(key);
     if (it == profiles_.end()) return false;
     out = it->second;
     return true;
 }
 
 static std::string profileLine(const std::string& sha1, const RomDbProfile& p) {
-    char bm = (char)('0' + (p.biosMode > 5 ? 0 : p.biosMode));
-    return sha1 + "," + std::string(mapperTypeName(p.mapper)) + "," + std::string(1, bm) + "," + std::string(1, p.font) + "\n";
+    std::string b = p.msxBasic ? "basic" : "none";
+    char f = (p.font == 'j' || p.font == 'J' || p.font == 'k' || p.font == 'K') ? 'j' : 'e';
+    return sha1 + "," + std::string(mapperTypeName(p.mapper)) + "," + b + "," + std::string(1, f) + "\n";
 }
 
 bool MapperDb::upsertProfile(const std::string& path, const std::string& sha1, const RomDbProfile& profile) {
@@ -143,9 +268,9 @@ bool MapperDb::upsertProfile(const std::string& path, const std::string& sha1, c
             }
             std::vector<std::string> p;
             splitCsv(trim(std::string(buf)), p);
-            if (!p.empty() && p[0].size() == 40 && p[0] == sha1) {
+            if (!p.empty() && normalizeSha1Key(p[0]) == normalizeSha1Key(sha1)) {
                 if (!replaced) {
-                    lines.push_back(profileLine(sha1, profile));
+                    lines.push_back(profileLine(normalizeSha1Key(sha1), profile));
                     replaced = true;
                 }
                 continue;
@@ -156,21 +281,22 @@ bool MapperDb::upsertProfile(const std::string& path, const std::string& sha1, c
     }
     if (!replaced) {
         if (!hadHeader && lines.empty())
-            lines.push_back("# sha1,mapper,bios,font  bios: 0=emb 1=C-BIOS 2=VG8020 3=main+logo 4=HB-10 5=C-BIOS JP  font: legacy (use bios 5 for JP)\n");
-        lines.push_back(profileLine(sha1, profile));
+            lines.push_back(
+                "# sha1,mapper,basic_or_none,font  basic+e=VG8020 basic+j=HB-10 none+e=C-BIOS none+j=C-BIOS JP\n");
+        lines.push_back(profileLine(normalizeSha1Key(sha1), profile));
     }
     FILE* fout = fopen(path.c_str(), "w");
     if (!fout) return false;
     for (const std::string& s : lines) fputs(s.c_str(), fout);
     fclose(fout);
-    profiles_[sha1] = profile;
+    profiles_[normalizeSha1Key(sha1)] = profile;
     return true;
 }
 
 bool MapperDb::upsert(const std::string& path, const std::string& sha1, MapperType mapper) {
     RomDbProfile p;
     if (!findProfile(sha1, p)) {
-        p.biosMode = 0;
+        p.msxBasic = false;
         p.font = 'e';
     }
     p.mapper = mapper;

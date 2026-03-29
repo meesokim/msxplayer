@@ -5,6 +5,10 @@ test_sdl
 test_sdl.exe
 sc2_check
 sc2_check.exe
+verify_core
+verify_tools
+vramviewer
+vramviewer.exe
 *.exe
 *.rom
 *.zip
@@ -16,6 +20,14 @@ sc2_check.exe
 capture.sc2
 capture.bmp
 check_sc2.bmp
+issue_captures/
+
+# Per-machine / session data (same idea as last_game.txt)
+game_issue_tags.txt
+msx.db
+
+# Local ROM collections (not project sources)
+MSX1/
 
 # Logs
 output.txt

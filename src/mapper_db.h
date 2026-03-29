@@ -7,10 +7,17 @@
 
 struct RomDbProfile {
     MapperType mapper = MAPPER_NONE;
-    /** 0=emb 1=C-BIOS intl 2=VG8020 3=main+logo 4=HB-10 5=C-BIOS JP (cbios_main_msx1_jp.rom) */
-    unsigned char biosMode = 0;
-    char font = 'e'; /* e=international, j=Japanese, k=Korean */
+    /** false=C-BIOS family, true=MSX BASIC ROM (VG8020 / HB-10). */
+    bool msxBasic = false;
+    /** 'e' intl, 'j' JP (CSV may use k → read as j). */
+    char font = 'e';
 };
+
+/** Maps DB row to biosLoader mode: 1=C-BIOS 2=VG8020 4=HB-10 5=C-BIOS JP (0/3 not in DB). */
+unsigned char romDbProfileBiosMode(const RomDbProfile& p);
+
+/** F12 save: session biosMode → DB basic/none + font. */
+void romDbProfileFromSessionBios(RomDbProfile& p, unsigned char biosMode);
 
 class MapperDb {
 public:
@@ -27,5 +34,8 @@ private:
 
 const char* mapperTypeName(MapperType mapper);
 MapperType mapperTypeFromName(const std::string& name);
+
+const char* romDbBiosShortLabel(const RomDbProfile& p);
+void romDbFormatMenuMeta(const RomDbProfile& p, char* out, size_t outSz);
 
 #endif

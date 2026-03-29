@@ -3,7 +3,7 @@ CC = gcc
 CXX = g++
 STRIP = strip
 
-BLUE_MSX_SRC = /home/msx/blueberryMSX/Src
+BLUE_MSX_SRC = $(CURDIR)/blueberryMSX/Src
 
 INCLUDES = -I$(BLUE_MSX_SRC)/Common \
            -I$(BLUE_MSX_SRC)/Z80 \
@@ -40,11 +40,14 @@ SCC_SRC = $(BLUE_MSX_SRC)/SoundChips/SCC.c
 FB_SRC  = $(BLUE_MSX_SRC)/VideoChips/FrameBuffer.c
 
 # Our source files
-MY_OBJS = main.o video.o memory.o io.o sound.o stubs.o vram_viewer.o vdp_test.o bios_data.o bios_loader.o hash_util.o mapper_db.o
+MY_OBJS = main.o video.o memory.o io.o sound.o stubs.o vram_viewer.o vdp_test.o bios_data.o bios_loader.o hash_util.o mapper_db.o game_issue_tags.o rom_index_detect.o msx_dir_index.o png_write_stb.o msx1_render_frame.o vram_snapshot.o
 BLUE_OBJS = VDP.o R800.o AY8910.o SCC.o FrameBuffer.o Zip.o IoApi.o Adler32.o Crc32.o InfFast.o Inflate.o InfTrees.o Zutil.o
 OBJS = $(MY_OBJS) $(BLUE_OBJS)
 
-all: msxplay msxplay.exe verify verify-tools
+VRAMVIEWER_OBJS = vramviewer_main.o msx1_render_frame.o vram_snapshot.o
+WIN_VRAMVIEWER_LDFLAGS = -L$(LOCAL_WIN)/lib -static -lmingw32 -lSDL2main -lSDL2 -mconsole -lkernel32 -luser32 -lgdi32 -lwinmm -limm32 -lole32 -loleaut32 -lversion -luuid -ladvapi32 -lsetupapi -lshell32
+
+all: msxplay msxplay.exe verify verify-tools vramviewer vramviewer.exe
 
 msxplay: $(OBJS)
 	$(CXX) -o msxplay $(OBJS) $(LDFLAGS)
@@ -211,5 +214,11 @@ win_Zutil.o: $(BLUE_MSX_SRC)/Unzip/zutil.c
 msxplay.exe: $(OBJS:%.o=win_%.o)
 	$(WIN_CXX) -o msxplay.exe $(OBJS:%.o=win_%.o) $(WIN_LDFLAGS)
 
+vramviewer: $(VRAMVIEWER_OBJS)
+	$(CXX) -o vramviewer $(VRAMVIEWER_OBJS) -lSDL2
+
+vramviewer.exe: win_vramviewer_main.o win_msx1_render_frame.o win_vram_snapshot.o $(WIN_MINGW_STAMP)
+	$(WIN_CXX) -o vramviewer.exe win_vramviewer_main.o win_msx1_render_frame.o win_vram_snapshot.o $(WIN_VRAMVIEWER_LDFLAGS)
+
 clean:
-	rm -f msxplay msxplay.exe *.o
+	rm -f msxplay msxplay.exe vramviewer vramviewer.exe *.o

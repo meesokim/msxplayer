@@ -64,12 +64,12 @@ extern "C" void vdpCmdSaveState(void* vdpCmdState) {}
 extern "C" void vdpCmdDestroy(void* vdpCmdState) {}
 extern "C" void vdpCmdPeek(void* vdpCmdState) {}
 extern "C" void vdpCmdWrite(void* vdpCmdState, int reg, UInt8 value) {}
-static UInt8* capturedVramPtr = NULL;
-extern "C" void* vdpCmdCreate(int vramSize, UInt8* vramPtr, UInt32 systemTime) { 
-    capturedVramPtr = vramPtr;
-    return (void*)1; 
+extern "C" void* vdpCmdCreate(int vramSize, UInt8* vramPtr, UInt32 systemTime) {
+    (void)vramSize;
+    (void)vramPtr;
+    (void)systemTime;
+    return (void*)1;
 }
-extern "C" UInt8* vdpGetVramPtr() { return capturedVramPtr; }
 
 #include "VideoManager.h"
 #include "FrameBuffer.h"

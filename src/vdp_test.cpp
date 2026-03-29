@@ -47,7 +47,7 @@ void runVdpDiagnostics() {
     writeIoPort(vdp, 0x98, 0x0F);
 
     // 4. FrameBuffer Integrity Check
-    RefreshScreen(2);
+    RefreshScreen(-1);
     FrameBuffer* fb = frameBufferGetDrawFrame();
     if (fb) {
         int nonZero = 0;

@@ -90,7 +90,7 @@ static int buildMapperDb(const std::string& romRoot, const std::string& openMsxX
     listFilesRec(romRoot, files);
     FILE* out = fopen(outDb.c_str(), "w");
     if (!out) return 1;
-    fprintf(out, "# sha1,mapper,basic,font  (basic 0/1, font e/j/k; verify_tools uses 0,e)\n");
+    fprintf(out, "# sha1,mapper,basic_or_none,font  basic+e=VG8020 basic+j=HB-10 none+e=C-BIOS none+j=C-BIOS JP\n");
     int total = 0, matched = 0;
     for (const std::string& p : files) {
         if (!(endsWithLower(p, ".rom") || endsWithLower(p, ".mx1") || endsWithLower(p, ".bin"))) continue;
@@ -103,7 +103,7 @@ static int buildMapperDb(const std::string& romRoot, const std::string& openMsxX
             mapper = it->second;
             matched++;
         }
-        fprintf(out, "%s,%s,0,e\n", sha1.c_str(), mapperTypeName(mapper));
+        fprintf(out, "%s,%s,none,e\n", sha1.c_str(), mapperTypeName(mapper));
         total++;
     }
     fclose(out);
