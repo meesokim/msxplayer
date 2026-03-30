@@ -1362,7 +1362,9 @@ int main_emu(int argc, char* argv[]) {
                     if (e.key.keysym.sym == SDLK_UP) menuSel--; else if (e.key.keysym.sym == SDLK_DOWN) menuSel++;
                     else if (e.key.keysym.sym == SDLK_PAGEUP || e.key.keysym.sym == SDLK_LEFT) menuSel -= pageSize;
                     else if (e.key.keysym.sym == SDLK_PAGEDOWN || e.key.keysym.sym == SDLK_RIGHT) menuSel += pageSize;
-                    else if (e.key.keysym.sym == SDLK_RETURN) {
+                    else if ((((e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) &&
+                               !(e.key.keysym.mod & KMOD_ALT)) ||
+                              e.key.keysym.sym == SDLK_SPACE)) {
                         std::string full = baseDir + "/" + menuEntryFilename(romFiles, menuSel);
                         if (loadRom(full.c_str())) {
                             saveLastGame(menuEntryFilename(romFiles, menuSel).c_str());

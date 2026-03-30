@@ -105,7 +105,7 @@ make msxplay.exe
 **In menu**
 
 - **Arrows / PgUp / PgDn** — move selection  
-- **Enter** — run selected ROM  
+- **Enter** / **Space** — run selected ROM (**Alt+Enter** is fullscreen only, does not launch)  
 - **B** — cycle BIOS preset for the next run  
 - **Ctrl+C** — copy full path of highlighted ROM  
 - **E** / **U** — mark / unmark issue tag for highlighted ROM  
