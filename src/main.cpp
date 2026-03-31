@@ -781,6 +781,12 @@ UInt8 readMemory(void* ref, UInt16 address) {
                 } else {
                     int bankIdx = (address - 0x4000) / 0x2000;
                     int bank = romBanks[bankIdx];
+                    /* openMSX RomKonami: 4000h–5FFF is fixed to ROM block 0; only 6000h–BFFF are
+                     * switchable (any address in each 8K window, not only 6000/8000/A000). */
+                    if (romMapper == MAPPER_KONAMI) {
+                        if (address < 0x6000)
+                            bank = 0;
+                    }
                     offset = (bank * 0x2000) + (address % 0x2000);
                 }
                 if (offset < romSize) return romData[offset];
@@ -830,13 +836,13 @@ void writeMemory(void* ref, UInt16 address, UInt8 value) {
                 return;
             }
         } else if (romMapper == MAPPER_KONAMI) {
-            if (address == 0x6000 || address == 0x8000 || address == 0xA000) {
-                 int nb8 = romSize / 0x2000;
-                 if (nb8 < 1) nb8 = 1;
-                 if (address == 0x6000) romBanks[1] = value % nb8;
-                 else if (address == 0x8000) romBanks[2] = value % nb8;
-                 else if (address == 0xA000) romBanks[3] = value % nb8;
-                 return;
+            /* openMSX RomKonami::writeMem — any write in 6000h–BFFF switches that 8K page */
+            if (address >= 0x6000 && address < 0xC000) {
+                int nb8 = romSize / 0x2000;
+                if (nb8 < 1) nb8 = 1;
+                int region = address >> 13;
+                romBanks[region - 2] = (int)((unsigned)value % (unsigned)nb8);
+                return;
             }
         } else if (romMapper == MAPPER_ASCII16) {
             /* openMSX RomAscii16kB: only 6000–67FF and 7000–77FF; 6800–6FFF (bit 0x800) ignored */
@@ -1194,6 +1200,16 @@ static void menuResetGamepadNavState(void) {
     memset(g_menuPadPrev, 0, sizeof(g_menuPadPrev));
 }
 
+/** Physical modifier keys — SDL keysym.mod can stay wrong after Ctrl/Alt combos (e.g. menu B ignored). */
+static bool menuKbCtrlHeld(void) {
+    const Uint8* kb = SDL_GetKeyboardState(NULL);
+    return kb[SDL_SCANCODE_LCTRL] != 0 || kb[SDL_SCANCODE_RCTRL] != 0;
+}
+static bool menuKbAltHeld(void) {
+    const Uint8* kb = SDL_GetKeyboardState(NULL);
+    return kb[SDL_SCANCODE_LALT] != 0 || kb[SDL_SCANCODE_RALT] != 0;
+}
+
 static void menuUpdateGamepad(std::vector<std::string>& romFiles, int& menuSel, int& menuOff,
     const std::string& baseDir, bool& quit, AppState& appState) {
     const int n = menuEntryCount(romFiles);
@@ -1352,9 +1368,9 @@ int main_emu(int argc, char* argv[]) {
                 }
             }
             if (e.type == SDL_KEYDOWN) {
-                if (e.key.keysym.sym == SDLK_F4 && (e.key.keysym.mod & KMOD_ALT))
+                if (e.key.keysym.sym == SDLK_F4 && menuKbAltHeld())
                     quit = true;
-                if (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)) {
+                if ((e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) && menuKbAltHeld()) {
                     fullscreen = !fullscreen; SDL_SetWindowFullscreen(getMainWindow(), fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
                 }
                 if (appState == STATE_MENU) {
@@ -1363,7 +1379,7 @@ int main_emu(int argc, char* argv[]) {
                     else if (e.key.keysym.sym == SDLK_PAGEUP || e.key.keysym.sym == SDLK_LEFT) menuSel -= pageSize;
                     else if (e.key.keysym.sym == SDLK_PAGEDOWN || e.key.keysym.sym == SDLK_RIGHT) menuSel += pageSize;
                     else if ((((e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) &&
-                               !(e.key.keysym.mod & KMOD_ALT)) ||
+                               !menuKbAltHeld()) ||
                               e.key.keysym.sym == SDLK_SPACE)) {
                         std::string full = baseDir + "/" + menuEntryFilename(romFiles, menuSel);
                         if (loadRom(full.c_str())) {
@@ -1371,9 +1387,9 @@ int main_emu(int argc, char* argv[]) {
                             startEmulator();
                             appState = STATE_EMU;
                         }
-                    } else if (e.key.keysym.sym == SDLK_b && !(e.key.keysym.mod & KMOD_CTRL)) {
+                    } else if (e.key.keysym.scancode == SDL_SCANCODE_B && !menuKbCtrlHeld()) {
                         menuAdvanceBiosMode();
-                    } else if (e.key.keysym.sym == SDLK_c && (e.key.keysym.mod & KMOD_CTRL)) {
+                    } else if (e.key.keysym.scancode == SDL_SCANCODE_C && menuKbCtrlHeld()) {
                         if (menuEntryCount(romFiles) > 0 && menuSel >= 0 && menuSel < menuEntryCount(romFiles)) {
                             std::string full = baseDir + "/" + menuEntryFilename(romFiles, menuSel);
 #ifdef _WIN32
@@ -1388,7 +1404,7 @@ int main_emu(int argc, char* argv[]) {
                             }
 #endif
                         }
-                    } else if (e.key.keysym.sym == SDLK_e && !(e.key.keysym.mod & KMOD_CTRL)) {
+                    } else if (e.key.keysym.scancode == SDL_SCANCODE_E && !menuKbCtrlHeld()) {
                         if (menuEntryCount(romFiles) > 0 && menuSel >= 0 && menuSel < menuEntryCount(romFiles)) {
                             if (g_menuUseDirIndex) {
                                 std::string sh = g_menuEntries[(size_t)menuSel].sha1;
@@ -1415,7 +1431,7 @@ int main_emu(int argc, char* argv[]) {
                             }
                             fflush(stdout);
                         }
-                    } else if (e.key.keysym.sym == SDLK_u && !(e.key.keysym.mod & KMOD_CTRL)) {
+                    } else if (e.key.keysym.scancode == SDL_SCANCODE_U && !menuKbCtrlHeld()) {
                         if (menuEntryCount(romFiles) > 0 && menuSel >= 0 && menuSel < menuEntryCount(romFiles)) {
                             if (g_menuUseDirIndex) {
                                 std::string sh = g_menuEntries[(size_t)menuSel].sha1;
@@ -1481,7 +1497,7 @@ int main_emu(int argc, char* argv[]) {
                     }
                     if (e.key.keysym.sym == SDLK_F8) scanlinesEnabled = !scanlinesEnabled;
                     if (e.key.keysym.sym == SDLK_PRINTSCREEN) { saveVramSc2("capture.sc2"); saveScreenshot("capture.bmp"); }
-                    if (e.key.keysym.sym == SDLK_e && !(e.key.keysym.mod & KMOD_CTRL) && romData && romSize > 0) {
+                    if (e.key.keysym.scancode == SDL_SCANCODE_E && !menuKbCtrlHeld() && romData && romSize > 0) {
                         std::string sh = sha1Hex(romData, (size_t)romSize);
                         if (g_issueTags.add(sh))
                             printf("game_issue_tags: marked %s\n", sh.c_str());
@@ -1515,7 +1531,7 @@ int main_emu(int argc, char* argv[]) {
                         fflush(stdout);
                         }
                     }
-                    if (e.key.keysym.sym == SDLK_F5 && (e.key.keysym.mod & KMOD_CTRL)) cycleMapperAndSoftReset();
+                    if (e.key.keysym.sym == SDLK_F5 && menuKbCtrlHeld()) cycleMapperAndSoftReset();
                     if (e.key.keysym.sym == SDLK_F12 && romData) {
                         if (!g_mapperDbTriedLoad) {
                             g_mapperDb.load(kMapperDbPath);

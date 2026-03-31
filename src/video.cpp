@@ -11,9 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-extern "C" {
-int vdp_msxplay_coherent_frame_grab = 0;
-}
+/* Defined in blueberryMSX VDP.c — do not duplicate here (linker ODR). */
+extern "C" int vdp_msxplay_coherent_frame_grab;
 #include <vector>
 #include <string>
 #include <algorithm>

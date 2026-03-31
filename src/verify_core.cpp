@@ -51,6 +51,8 @@ UInt8 readMemory(void* ref, UInt16 address) {
             if (address >= 0x4000 && address < 0xC000) {
                 int bankIdx = (address - 0x4000) / 0x2000;
                 int bank = romBanks[bankIdx];
+                if (romMapper == MAPPER_KONAMI && address < 0x6000)
+                    bank = 0;
                 int offset = (bank * 0x2000) + (address % 0x2000);
                 if (offset < (int)romSize) return romData[offset];
             }
@@ -65,9 +67,12 @@ void writeMemory(void* ref, UInt16 address, UInt8 value) {
     int slot = (primarySlot >> (page * 2)) & 0x03;
     if ((slot == 1 || slot == 2) && address >= 0x4000 && address < 0xC000) {
         if (romMapper == MAPPER_KONAMI) {
-            if (address == 0x6000) romBanks[1] = value % (romSize / 0x2000);
-            else if (address == 0x8000) romBanks[2] = value % (romSize / 0x2000);
-            else if (address == 0xA000) romBanks[3] = value % (romSize / 0x2000);
+            if (address >= 0x6000 && address < 0xC000) {
+                int nb8 = romSize / 0x2000;
+                if (nb8 < 1) nb8 = 1;
+                int region = address >> 13;
+                romBanks[region - 2] = (int)((unsigned)value % (unsigned)nb8);
+            }
         } else if (romMapper == MAPPER_ASCII8) {
             if (address >= 0x6000 && address < 0x6800) romBanks[0] = value % (romSize / 0x2000);
             else if (address >= 0x6800 && address < 0x7000) romBanks[1] = value % (romSize / 0x2000);
@@ -100,6 +105,10 @@ void test_mapper_konami() {
     writeMemory(NULL, 0x6000, 10);
     assert(romBanks[1] == 10);
     assert(readMemory(NULL, 0x6000) == 10);
+
+    writeMemory(NULL, 0x6010, 11);
+    assert(romBanks[1] == 11);
+    assert(readMemory(NULL, 0x6010) == 11);
 
     writeMemory(NULL, 0x8000, 5);
     assert(romBanks[2] == 5);
