@@ -88,10 +88,10 @@ extern "C" void msx1RenderFrameToRgb565(const UInt8* vram, const UInt8* regs, co
     int fg = regs[7] >> 4, bg = regs[7] & 0x0F;
     UInt16 pfg = palette[fg], pbg = palette[bg];
 
-    /* Prioritize mode detection from registers (M1, M2, M3)
-     * mixKey bits: bit 0 = M3, bit 3 = M2, bit 4 = M1
+    /* Prioritize mode detection from registers (M1, M2, M3, M4, M5)
+     * mixKey bits: bit 0=M3, bit 1=M4, bit 2=M5, bit 3=M2, bit 4=M1
      * 0x10: Text 1 (Screen 0)
-     * 0x01: Graphic 2 (Screen 2)
+     * 0x01 or 0x04: Graphic 2/3 (Screen 2/4)
      * 0x08: Multicolor (Screen 3)
      * 0x00: Graphic 1 (Screen 1)
      */
@@ -108,22 +108,26 @@ extern "C" void msx1RenderFrameToRgb565(const UInt8* vram, const UInt8* regs, co
                 for (int b = 0; b < 6; b++) fb[dstOff + tx * 6 + b] = (pat & (0x80 >> b)) ? pfg : pbg;
             }
         }
-    } else if (mixKey & 0x01) {
-        /* Screen 2 (Graphic 2) */
-        const int chrTabBase = (((int)regs[2] << 10) | 0x3FF) & vramMask;
-        /* Standard Screen 2: Pattern generator base uses regs[4] mask; color table base uses regs[3] mask. */
-        const int chrGenBase = (((int)regs[4] << 11) | 0x7FF) & vramMask;
-        const int colTabBase = (((int)regs[10] << 14) | ((int)regs[3] << 6) | 0x3F) & vramMask;
+    } else if (mixKey & 0x05) {
+        /* Screen 2 (Graphic 2) or Screen 4 (Graphic 3) */
+        const int chrTabBase = ((int)regs[2] << 10) & vramMask;
+        /* Screen 2/4: R#4 bits 0-1 are mask, bits 2-5 are base. R#3 bits 0-6 are mask, bit 7 is base. */
+        const int chrGenBase = ((int)(regs[4] & 0x3C) << 11) & vramMask;
+        const int chrGenMask = ((int)(regs[4] & 0x03) << 11) | 0x7FF;
+        const int colTabBase = (((int)regs[10] << 14) | ((int)(regs[3] & 0x80) << 6)) & vramMask;
+        const int colTabMask = ((int)(regs[3] & 0x7F) << 6) | 0x3F;
+
         for (int y = 0; y < 192; y++) {
+            const int zone = (y & 0xC0) << 5;
+            const int line = y & 7;
             const int row = (y / 8) * 32;
-            const unsigned baseU = 0xFFFFE000u | ((unsigned)(y & 0xC0) << 5) | (unsigned)(y & 7);
             int dstOff = (y + 24) * 272 + 8;
             for (int tx = 0; tx < 32; tx++) {
-                const int ntAddr = (chrTabBase & (int)(0xFFFFFC00u | (unsigned)(row + tx))) & vramMask;
+                const int ntAddr = (chrTabBase | (row + tx)) & vramMask;
                 const UInt8 code = vram[ntAddr];
-                const int idx = (int)(baseU | ((unsigned)code << 3));
-                const UInt8 pat = vram[(chrGenBase & idx) & vramMask];
-                const UInt8 col = vram[(colTabBase & idx) & vramMask];
+                const int pIdx = zone | (code << 3) | line;
+                const UInt8 pat = vram[(chrGenBase | (pIdx & chrGenMask)) & vramMask];
+                const UInt8 col = vram[(colTabBase | (pIdx & colTabMask)) & vramMask];
                 UInt16 pf = palette[col >> 4], pb = palette[col & 0x0F];
                 for (int b = 0; b < 8; b++) fb[dstOff + tx * 8 + b] = (pat & (0x80 >> b)) ? pf : pb;
             }
@@ -132,7 +136,7 @@ extern "C" void msx1RenderFrameToRgb565(const UInt8* vram, const UInt8* regs, co
         /* Screen 3 (Multicolor) */
         renderMSX1Screen3(vram, regs, palette, vramMask, fb);
     } else {
-        /* Screen 1 (Graphic 1) - fallback for mixKey 0x00 or unknown */
+        /* Screen 1 (Graphic 1) */
         int nt = (regs[2] << 10) & vramMask;
         int pb = (regs[4] << 11) & vramMask;
         int ct = (regs[3] << 6) & vramMask;

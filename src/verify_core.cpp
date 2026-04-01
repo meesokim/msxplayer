@@ -170,25 +170,28 @@ void test_vram_to_rgb_logic() {
 
     regs[2] = 0x06;
     regs[4] = 0x03;
-    regs[3] = 0x80; /* color table base — separates pat vs col fetch for y=128, tile 0 */
+    regs[3] = 0x80; /* color table base 0x2000, mask 0x00 */
+    regs[10] = 0x00;
 
     const int y = 128;
     vram[0x1800 + (y / 8) * 32] = 0x00;
     vram[0x1000] = 0x80;
     vram[0x2000] = 0xF1;
 
-    const int chrTabBase = (((int)regs[2] << 10) | 0x3FF) & 0x3FFF;
-    /* Standard Screen 2: Pattern generator base uses regs[4] mask; color table base uses regs[3] mask. */
-    const int chrGenBase = (((int)regs[4] << 11) | 0x7FF) & 0x3FFF;
-    const int colTabBase = (((int)regs[10] << 14) | ((int)regs[3] << 6) | 0x3F) & 0x3FFF;
+    const int chrTabBase = ((int)regs[2] << 10) & 0x3FFF;
+    const int chrGenBase = ((int)(regs[4] & 0x3C) << 11) & 0x3FFF;
+    const int chrGenMask = ((int)(regs[4] & 0x03) << 11) | 0x7FF;
+    const int colTabBase = (((int)regs[10] << 14) | ((int)(regs[3] & 0x80) << 6)) & 0x3FFF;
+    const int colTabMask = ((int)(regs[3] & 0x7F) << 6) | 0x3F;
 
+    const int zone = (y & 0xC0) << 5;
+    const int line = y & 7;
     const int row = (y / 8) * 32;
-    const unsigned baseU = 0xFFFFE000u | ((unsigned)(y & 0xC0) << 5) | (unsigned)(y & 7);
-    const int ntAddr = (chrTabBase & (int)(0xFFFFFC00u | (unsigned)row)) & 0x3FFF;
+    const int ntAddr = (chrTabBase | row) & 0x3FFF;
     const UInt8 code = vram[ntAddr];
-    const int idx = (int)(baseU | ((unsigned)code << 3));
-    const UInt8 pat = vram[(chrGenBase & idx) & 0x3FFF];
-    const UInt8 col = vram[(colTabBase & idx) & 0x3FFF];
+    const int pIdx = zone | (code << 3) | line;
+    const UInt8 pat = vram[(chrGenBase | (pIdx & chrGenMask)) & 0x3FFF];
+    const UInt8 col = vram[(colTabBase | (pIdx & colTabMask)) & 0x3FFF];
 
     assert(pat == 0x80);
     assert(col == 0xF1);
