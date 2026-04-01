@@ -533,9 +533,16 @@ static void detectMapper() {
                     romMapper = MAPPER_PAGE2;
             }
         }
-        /* openMSX RomFactory::guessRomType: ROM < 64K and not PAGE2 -> Mirrored (wrap past ROM in cart window). */
-        if (romMapper == MAPPER_NONE && !(haveProf && prof.mapper == MAPPER_NONE))
-            romMapper = MAPPER_MIRRORED;
+        /* openMSX RomPlain: "Normal4000" = linear ROM in 4000h–BFFFh, no mirror (software DB often uses this).
+         * Auto "Mirrored" wraps past ROM end; wrong g_mirroredFirstPage breaks many plain carts (text/garbage). */
+        if (romMapper == MAPPER_NONE && !(haveProf && prof.mapper == MAPPER_NONE)) {
+            bool hasHeader0 = (romSize >= 2 && romData[0] == 'A' && romData[1] == 'B');
+            bool hasHeader4 = (romSize >= 0x4002 && romData[0x4000] == 'A' && romData[0x4001] == 'B');
+            if (hasHeader0 || hasHeader4)
+                ; /* keep NONE */
+            else
+                romMapper = MAPPER_MIRRORED;
+        }
 
         applyMenuOrDbBasicFont(sha1, haveProf, prof);
         romBanks[0] = 0;
@@ -734,8 +741,9 @@ UInt8 readMemory(void* ref, UInt16 address) {
             if (startsAtZero) {
                 if (address < romSize) return romData[address];
             } else { // Starts at 0x4000
-                if (address >= 0x4000) {
+                if (address >= 0x4000 && address < 0xC000) {
                     UInt16 off = address - 0x4000;
+                    /* Standard 16KB cart mirrors at 8000h. 32KB cart is linear 4000-BFFF. */
                     if (romSize <= 0x4000) off &= 0x3FFF;
                     if (off < romSize) return romData[off];
                 }
@@ -1155,8 +1163,8 @@ void startEmulator() {
                 } else { // <= 32KB at 0x0000
                     primarySlot = 0xF5; // P0,P1=ROM, P2-3=RAM
                 }
-            } else { // Standard ROM at 0x4000
-                primarySlot = 0xD4;
+            } else { // Standard ROM at 0x4000 (and 0x8000 for 32KB or 16KB mirror)
+                primarySlot = 0xD4; // P0=Slot0, P1=Slot1, P2=Slot1, P3=Slot3
             }
         } else if (romMapper == MAPPER_PAGE2) {
             /* P0,P1=slot0 BIOS; P2=slot1 cart @8000h; P3=RAM (openMSX PAGE2 layout) */

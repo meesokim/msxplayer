@@ -172,6 +172,8 @@ MapperType mapperTypeFromName(const std::string& nameIn) {
     if (name == "MSXWrite") return MAPPER_MSXWRITE;
     if (name == "ASCII16SRAM2") return MAPPER_ASCII16_SRAM2;
     if (name == "MIRRORED") return MAPPER_MIRRORED;
+    /* openMSX software DB: plain ROM @4000h (same as msxplay NONE + cart at 4000h) */
+    if (name == "NORMAL4000") return MAPPER_NONE;
     if (name == "PAGE2") return MAPPER_PAGE2;
     if (name == "RTYPE") return MAPPER_RTYPE;
     return MAPPER_NONE;

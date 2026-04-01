@@ -178,8 +178,8 @@ void test_vram_to_rgb_logic() {
     vram[0x2000] = 0xF1;
 
     const int chrTabBase = (((int)regs[2] << 10) | 0x3FF) & 0x3FFF;
-    /* Same as video.cpp msx1Graphic2ChrGenBase / msx1Graphic2ColTabBase (TMS9918A R#3 leak). */
-    const int chrGenBase = (((int)regs[4] << 11) | (((int)regs[3] & 0x1F) << 6) | 0x3F) & 0x3FFF;
+    /* Standard Screen 2: Pattern generator base uses regs[4] mask; color table base uses regs[3] mask. */
+    const int chrGenBase = (((int)regs[4] << 11) | 0x7FF) & 0x3FFF;
     const int colTabBase = (((int)regs[10] << 14) | ((int)regs[3] << 6) | 0x3F) & 0x3FFF;
 
     const int row = (y / 8) * 32;
