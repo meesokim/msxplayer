@@ -500,7 +500,7 @@ extern "C" void DrawMenu(const std::vector<std::string>* plainFiles, const std::
             snprintf(foot1, sizeof(foot1), "B: next BIOS  now:%s", bl);
         }
         menuDrawText(fb, vpW, vpH, marginX, yFoot1, foot1, kMenuFootHi, kMenuBg, footCw, footCh, ft);
-        menuDrawText(fb, vpW, vpH, marginX, yFoot2, "E=mark  U=unmark  Enter=start  Alt+F4=quit", kMenuFootLo, kMenuBg, footCw, footCh, ft);
+        menuDrawText(fb, vpW, vpH, marginX, yFoot2, "C+A+E=mark  C+A+U=unmark  Enter=start  Alt+F4=quit", kMenuFootLo, kMenuBg, footCw, footCh, ft);
     }
 
     if (menuTextureId == 0) {

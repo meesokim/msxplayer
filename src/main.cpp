@@ -1412,7 +1412,7 @@ int main_emu(int argc, char* argv[]) {
                             }
 #endif
                         }
-                    } else if (e.key.keysym.scancode == SDL_SCANCODE_E && !menuKbCtrlHeld()) {
+                    } else if (e.key.keysym.scancode == SDL_SCANCODE_E && menuKbCtrlHeld() && menuKbAltHeld()) {
                         if (menuEntryCount(romFiles) > 0 && menuSel >= 0 && menuSel < menuEntryCount(romFiles)) {
                             if (g_menuUseDirIndex) {
                                 std::string sh = g_menuEntries[(size_t)menuSel].sha1;
@@ -1439,7 +1439,7 @@ int main_emu(int argc, char* argv[]) {
                             }
                             fflush(stdout);
                         }
-                    } else if (e.key.keysym.scancode == SDL_SCANCODE_U && !menuKbCtrlHeld()) {
+                    } else if (e.key.keysym.scancode == SDL_SCANCODE_U && menuKbCtrlHeld() && menuKbAltHeld()) {
                         if (menuEntryCount(romFiles) > 0 && menuSel >= 0 && menuSel < menuEntryCount(romFiles)) {
                             if (g_menuUseDirIndex) {
                                 std::string sh = g_menuEntries[(size_t)menuSel].sha1;
@@ -1505,7 +1505,7 @@ int main_emu(int argc, char* argv[]) {
                     }
                     if (e.key.keysym.sym == SDLK_F8) scanlinesEnabled = !scanlinesEnabled;
                     if (e.key.keysym.sym == SDLK_PRINTSCREEN) { saveVramSc2("capture.sc2"); saveScreenshot("capture.bmp"); }
-                    if (e.key.keysym.scancode == SDL_SCANCODE_E && !menuKbCtrlHeld() && romData && romSize > 0) {
+                    if (e.key.keysym.scancode == SDL_SCANCODE_E && menuKbCtrlHeld() && menuKbAltHeld() && romData && romSize > 0) {
                         std::string sh = sha1Hex(romData, (size_t)romSize);
                         if (g_issueTags.add(sh))
                             printf("game_issue_tags: marked %s\n", sh.c_str());
