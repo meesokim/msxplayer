@@ -69,6 +69,7 @@ extern "C" SDL_Window* getMainWindow();
 bool debugMode = false;
 bool vramViewerMode = false;
 bool scanlinesEnabled = true;
+bool g_isErrorGame = false;
 UInt8 primarySlot = 0x00;
 static AY8910* psg = NULL;
 static SCC* g_scc = NULL;
@@ -344,9 +345,9 @@ static void launchOpenMsxComparePath(const std::string& cartPath, unsigned char 
         argStorage.push_back("Sony_HB-10");
     }
     argStorage.push_back("-cart");
-    argStorage.push_back(shellQuoteForSystem(cart));
+    argStorage.push_back(cart);
     argStorage.push_back("-command");
-    argStorage.push_back(shellQuoteForSystem("set scale_factor 1"));
+    argStorage.push_back("set scale_factor 1");
 
     std::string show;
     for (size_t i = 0; i < argStorage.size(); ++i) {
@@ -355,7 +356,68 @@ static void launchOpenMsxComparePath(const std::string& cartPath, unsigned char 
     }
     printf("openMSX compare: %s\n", show.c_str());
     fflush(stdout);
+
+    {
+        FILE* f = fopen("cmd.log", "a");
+        if (f) {
+            fprintf(f, "openMSX compare cmd:");
+            for (const auto& a : argStorage) fprintf(f, " %s", a.c_str());
+            fprintf(f, "\n");
+            fclose(f);
+        }
+    }
+
     spawnOpenMsxDetached(std::move(argStorage));
+}
+
+static void launchVdpVerifier(const std::string& cartPath, unsigned char biosMode) {
+    if (cartPath.empty()) {
+        printf("vdp verifier: empty cart path\n");
+        fflush(stdout);
+        return;
+    }
+    std::string cart = canonicalFilePathForShell(cartPath);
+#ifdef _WIN32
+    std::string exe = "openMSX\\derived\\openmsx.exe";
+#else
+    std::string exe = "openMSX/derived/openmsx";
+#endif
+
+    printf("vdp verifier: running replay tool with openMSX via stdio...\n");
+    
+    std::vector<std::string> pyArgs;
+#ifdef _WIN32
+    pyArgs.push_back("python");
+    pyArgs.push_back("tools\\vdp_verify_replay.py");
+#else
+    pyArgs.push_back("python3");
+    pyArgs.push_back("tools/vdp_verify_replay.py");
+#endif
+    pyArgs.push_back("vdp_trace.log");
+    pyArgs.push_back(exe);
+    
+    // Add machine args for the replay tool to pass to openMSX
+    if (biosMode == 2) {
+        pyArgs.push_back("-machine");
+        pyArgs.push_back("Philips_VG_8020");
+    } else if (biosMode == 4) {
+        pyArgs.push_back("-machine");
+        pyArgs.push_back("Sony_HB-10");
+    }
+    pyArgs.push_back("-cart");
+    pyArgs.push_back(cart);
+
+    {
+        FILE* f = fopen("cmd.log", "a");
+        if (f) {
+            fprintf(f, "vdp verifier cmd:");
+            for (const auto& a : pyArgs) fprintf(f, " %s", a.c_str());
+            fprintf(f, "\n");
+            fclose(f);
+        }
+    }
+
+    spawnOpenMsxDetached(std::move(pyArgs));
 }
 /** Per-ROM SHA1: DB bios row applied only on first load with a row; later loads use menu (B). */
 static std::unordered_set<std::string> g_basicFontDbHydratedSha1;
@@ -516,6 +578,7 @@ static void detectMapper() {
     }
 
     const std::string sha1 = sha1Hex(romData, romSize);
+    g_isErrorGame = g_issueTags.contains(sha1);
     RomDbProfile prof;
     const bool haveProf = g_mapperDb.findProfile(sha1, prof);
 
@@ -1145,6 +1208,8 @@ void startEmulator() {
     ioPortRegister(0xA0, NULL, (IoPortWrite)myPsgWriteAddr, psg); ioPortRegister(0xA1, NULL, (IoPortWrite)ay8910WriteData, psg); ioPortRegister(0xA2, (IoPortRead)ay8910ReadData, NULL, psg);
     ioPortRegister(0xA9, (IoPortRead)keyboardRead, NULL, NULL); ioPortRegister(0xAA, NULL, (IoPortWrite)keyboardWrite, NULL);
     clearVideoAndAudioOnReset();
+    vdpTraceClose();
+    if (g_isErrorGame) vdpTraceOpen();
     if (!cpu) cpu = r800Create(0, (R800ReadCb)readMemory, (R800WriteCb)writeMemory, (R800ReadCb)r800ReadIo, (R800WriteCb)r800WriteIo, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
     r800Reset(cpu, 0);
     if (romMapper == MAPPER_ASCII8_SRAM2) g_a8s2_enable = 0;
@@ -1474,6 +1539,14 @@ int main_emu(int argc, char* argv[]) {
                             printf("openMSX compare: no game selected\n");
                             fflush(stdout);
                         }
+                    } else if (e.key.keysym.sym == SDLK_F10) {
+                        if (menuEntryCount(romFiles) > 0 && menuSel >= 0 && menuSel < menuEntryCount(romFiles)) {
+                            std::string full = baseDir + "/" + menuEntryFilename(romFiles, menuSel);
+                            launchVdpVerifier(full, menuBiosMode);
+                        } else {
+                            printf("vdp verifier: no game selected\n");
+                            fflush(stdout);
+                        }
                     }
                     if (menuSel < 0) menuSel = 0;
                     {
@@ -1502,6 +1575,13 @@ int main_emu(int argc, char* argv[]) {
                             fflush(stdout);
                         } else
                             launchOpenMsxComparePath(g_loadedRomFullPath, g_biosMode);
+                    }
+                    if (e.key.keysym.sym == SDLK_F10) {
+                        if (g_loadedRomFullPath.empty()) {
+                            printf("vdp verifier: no ROM loaded\n");
+                            fflush(stdout);
+                        } else
+                            launchVdpVerifier(g_loadedRomFullPath, g_biosMode);
                     }
                     if (e.key.keysym.sym == SDLK_F8) scanlinesEnabled = !scanlinesEnabled;
                     if (e.key.keysym.sym == SDLK_PRINTSCREEN) { saveVramSc2("capture.sc2"); saveScreenshot("capture.bmp"); }
@@ -1598,6 +1678,7 @@ int main_emu(int argc, char* argv[]) {
             SDL_Delay(16);
         }
     }
+    vdpTraceClose();
     closeGameController();
     SDL_Quit(); return 0;
 }

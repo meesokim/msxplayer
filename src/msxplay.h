@@ -28,12 +28,17 @@ extern int romSize;
 extern bool debugMode;
 extern bool vramViewerMode;
 extern bool scanlinesEnabled;
+extern bool g_isErrorGame;
 extern UInt8 primarySlot;
 extern UInt8 bios[0x8000];
 
 void* boardTimerCreate(void (*callback)(void*, UInt32), void* ref);
 void boardTimerAdd(void* timer, UInt32 time);
 void boardTimerDestroy(void* timer);
+
+extern "C" UInt8* vdpGetVramPtr();
+void vdpTraceOpen();
+void vdpTraceClose();
 
 #ifdef __cplusplus
 }
